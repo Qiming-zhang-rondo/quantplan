@@ -1,0 +1,170 @@
+schema_version: quantplan.experiment/v0alpha1
+experiment_id: qwen3.5-35b-a3b-p0-v1
+template: true
+runnable: false
+blocking_placeholders:
+  - model.revision
+  - scope.pilot_block_ids
+  - data.split_manifest_sha256
+  - backend.modelslim.version
+  - backend.runtime.container_digest
+  - backend.runtime.cann_version
+  - backend.runtime.torch_npu_version
+  - backend.runtime.engine_version
+  - hardware.sku
+  - hardware.topology
+
+provenance:
+  modelslim_audit_commit: 376e2fad43bc999f9a49b48bdbc3eef06ffdd83a
+  builtin_schema_manifest: modelslim-v1-schema-prototype
+  note: This file is a preregistration template, not an executable ModelSlim YAML.
+
+model:
+  model_id: Qwen/Qwen3.5-35B-A3B
+  revision: REQUIRED_BEFORE_RUN
+  modality: text-only
+  max_context_tokens: 4096
+  language_block_count: 40
+
+workloads:
+  risk_profiling:
+    mode: teacher-forced
+    decoding: null
+  truth_measurement:
+    mode: teacher-forced
+    metrics: [delta_nll_per_token, bf16_teacher_logits_kl]
+  final_quality_eval:
+    mode: generation
+    decoding_config: REQUIRED_BEFORE_RUN
+  hardware_benchmark:
+    mode: generation
+    batch_and_sequence_grid: REQUIRED_BEFORE_RUN
+
+scope:
+  decision_granularity: decoder-block
+  decision_group_count: 40
+  pilot_block_ids: REQUIRED_BEFORE_RUN
+  fixed_high_precision:
+    - id: moe_router_path
+      locked: true
+      precision: bf16
+      includes: [router_weights, router_logits, top_k_selection, route_normalization]
+      reason: P0 does not permit routing decisions to change with candidate precision.
+    - id: block_boundaries
+      locked: true
+      precision: bf16
+      includes: [rmsnorm, input_boundary, output_boundary]
+      reason: P0 measures block-internal quantization, not boundary quantization.
+  excluded:
+    - vision_encoder
+    - visual_projector
+    - multimodal_inputs
+    - mtp
+    - kv_cache_c4
+    - expert_level_assignment
+
+candidates:
+  w8a8:
+    status: SUPPORTED_VERIFIED
+    evidence_scope: partial_weight_generation_recipe_only
+    deployment_verified: false
+    exact_module_coverage_required: true
+  w4a8:
+    status: UNKNOWN
+    evidence_scope: exact_model_unverified
+  w4a4:
+    status: UNKNOWN
+    evidence_scope: exact_model_unverified
+  c4:
+    status: OUT_OF_SCOPE
+
+data:
+  split_seed: 20260817
+  split_manifest_sha256: REQUIRED_BEFORE_RUN
+  groups:
+    C0: {documents: 128, purpose: quantizer_calibration}
+    S1: {documents: 64, purpose: risk_scoring}
+    S2: {documents: 64, purpose: risk_scoring}
+    S3: {documents: 64, purpose: risk_scoring}
+    S4: {documents: 64, purpose: risk_scoring}
+    T1: {documents: 64, purpose: single_intervention_truth}
+    T2: {documents: 64, purpose: single_intervention_truth}
+    H1: {documents: 128, purpose: final_holdout}
+    H2: {documents: 128, purpose: final_holdout}
+  strata: [zh_instruction, en_instruction, math_code, long_context_1k_4k]
+  bootstrap_unit: prompt
+
+backend:
+  modelslim:
+    version: REQUIRED_BEFORE_RUN
+    integration: yaml_and_cli_subprocess_only
+  runtime:
+    container_digest: REQUIRED_BEFORE_RUN
+    cann_version: REQUIRED_BEFORE_RUN
+    torch_npu_version: REQUIRED_BEFORE_RUN
+    engine_version: REQUIRED_BEFORE_RUN
+  rule: Capability failures must not be recorded as Risk failures.
+
+hardware:
+  sku: REQUIRED_BEFORE_RUN
+  accelerator_count_per_node: 8
+  topology: REQUIRED_BEFORE_RUN
+  parallelism: REQUIRED_BEFORE_RUN
+
+pilot:
+  stage_1:
+    block_count: 8
+    stratify_by: [depth, gated_deltanet_vs_full_attention, moe_route_coverage]
+    min_median_risk_spearman: 0.50
+  stage_2:
+    block_count: 40
+    requires_stage_1_pass: true
+
+baselines:
+  random_plan_seed_count: 20
+  a4_cost_coverage_points: [0.25, 0.50, 0.75]
+  required:
+    - bf16
+    - official_partial_w8a8
+    - full_w4a8_experimental
+    - full_w4a4_experimental
+    - random_same_cost
+    - depth_heuristic
+    - structure_heuristic
+    - cheap_metrics
+    - marginal_oracle
+
+gates:
+  search_space_headroom:
+    oracle_improvement_over_random_median: 0.20
+  risk_stability:
+    min_scoring_group_median_spearman: 0.70
+  risk_vs_truth:
+    min_spearman: 0.60
+    min_prompt_bootstrap_95ci_lower_bound: 0.30
+    dangerous_top_k: 10
+    min_dangerous_recall: 0.75
+    min_ndcg_at_k: 0.75
+  plan_quality:
+    min_improvement_over_random_median: 0.20
+    min_improvement_over_best_preregistered_heuristic: 0.10
+    min_fraction_of_oracle_improvement: 0.70
+    max_overall_task_drop_percentage_points: 1.0
+    max_slice_task_drop_percentage_points: 2.0
+  hardware_value:
+    min_tpot_or_throughput_improvement: 0.05
+    undeclared_precision_fallback_allowed: false
+
+budget:
+  status: PROVISIONAL_UNTIL_HARDWARE_IS_FROZEN
+  planned_node_hours: 48
+  hard_limit_node_hours: 72
+  persistent_checkpoint_limit: 8
+  storage_limit_gb: 250
+
+reporting:
+  allowed_claim: >-
+    Best observed candidate among the explicitly evaluated set, after every
+    declared quality and hardware gate passes.
+  required_context: [evaluated_set, cost_budget, stopping_rule, version_fingerprint]
+  forbidden_claims: [universally_optimal_yaml, predicted_delta_nll, cross_model_generality]

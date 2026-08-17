@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quantplan"
+version = "0.1.0"
+description = "Evidence-driven mixed-precision planning for ModelSlim-compatible quantization workflows"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "PyYAML>=6.0",
+]
+
+[project.urls]
+Repository = "https://github.com/Qiming-zhang-rondo/quantplan"
+Issues = "https://github.com/Qiming-zhang-rondo/quantplan/issues"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.6",
+]
+
+[project.scripts]
+quantplan = "quantplan.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
