@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from math import isfinite
-from typing import Mapping, Sequence
 
 
 class PrecisionFormat(str, Enum):

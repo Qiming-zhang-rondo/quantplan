@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from math import isfinite
-from typing import Iterable, Mapping, Sequence
 
 from quantplan.domain.models import (
     CandidateEvidence,

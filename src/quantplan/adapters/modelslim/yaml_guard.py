@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from fnmatch import fnmatchcase
 from math import isfinite
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any
 
 import yaml
 from yaml.constructor import ConstructorError
@@ -590,13 +591,16 @@ class _Inspection:
                 _render_path(path),
                 "fa3_quant qconfig and details are mutually exclusive",
             )
-        if type_name == "dynamic_cache" and isinstance(value.get("qconfig"), Mapping):
-            if value["qconfig"].get("scope") != "per_channel":
-                self.block(
-                    "dynamic_cache_scope_invalid",
-                    _render_path((*path, "qconfig", "scope")),
-                    "dynamic_cache requires scope 'per_channel' in this manifest",
-                )
+        if (
+            type_name == "dynamic_cache"
+            and isinstance(value.get("qconfig"), Mapping)
+            and value["qconfig"].get("scope") != "per_channel"
+        ):
+            self.block(
+                "dynamic_cache_scope_invalid",
+                _render_path((*path, "qconfig", "scope")),
+                "dynamic_cache requires scope 'per_channel' in this manifest",
+            )
 
         include_matches: tuple[str, ...] | None = None
         if "include" in capability.pattern_fields and "include" in value:

@@ -43,7 +43,6 @@ from typing import Final
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-
 DEFAULT_EPSILON: Final[float] = 1e-12
 
 

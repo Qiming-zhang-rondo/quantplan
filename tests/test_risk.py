@@ -2,7 +2,6 @@ import numpy as np
 import pytest
 
 from quantplan.metrics.risk import (
-    PromptRiskResult,
     aggregate_prompt_risk,
     compute_prompt_risk,
 )

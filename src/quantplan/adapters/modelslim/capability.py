@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Iterable, Mapping
 
 
 class UnknownFieldStatus(str, Enum):
@@ -16,7 +16,6 @@ class UnknownFieldStatus(str, Enum):
     """
 
     KNOWN = "known"
-    SUPPORTED = "known"  # Readable alias for callers building UI labels.
     OPAQUE = "opaque"
     BLOCKING = "blocking"
 

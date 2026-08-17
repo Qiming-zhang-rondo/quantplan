@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from quantplan import __version__
 from quantplan.adapters.modelslim import inspect_modelslim_yaml
@@ -27,7 +28,7 @@ def _read_module_inventory(path: Path | None) -> tuple[str, ...] | None:
 def _read_score_mapping(path: Path) -> Mapping[str, float]:
     value: Any = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
-        raise ValueError(f"{path} must contain a JSON object")
+        raise TypeError(f"{path} must contain a JSON object")
     try:
         return {str(key): float(score) for key, score in value.items()}
     except (TypeError, ValueError) as exc:
@@ -114,6 +115,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.handler(args))
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
         parser.error(str(exc))
     return 2
