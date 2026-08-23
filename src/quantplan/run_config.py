@@ -37,6 +37,7 @@ class RuntimeConfig:
     analysis_only: bool = True
     trust_remote_code: bool = False
     strict_target_coverage: bool = True
+    allow_image_text_fallback: bool = False
 
     def __post_init__(self) -> None:
         if not _valid_loader(self.loader):
@@ -51,14 +52,17 @@ class RuntimeConfig:
             "auto",
             "bf16",
             "bfloat16",
-            "fp16",
-            "float16",
-            "fp32",
-            "float32",
         }:
-            raise RunConfigError("$.runtime.torch_dtype is not supported")
+            raise RunConfigError(
+                "$.runtime.torch_dtype must be bf16/bfloat16 or auto; "
+                "the P0 protection anchor cannot be labeled BF16 when loaded as FP16/FP32"
+            )
         _require_bool(self.analysis_only, "$.runtime.analysis_only")
         _require_bool(self.trust_remote_code, "$.runtime.trust_remote_code")
+        _require_bool(
+            self.allow_image_text_fallback,
+            "$.runtime.allow_image_text_fallback",
+        )
         _require_bool(
             self.strict_target_coverage, "$.runtime.strict_target_coverage"
         )
@@ -444,6 +448,7 @@ def parse_run_config(
             "torch_dtype",
             "analysis_only",
             "trust_remote_code",
+            "allow_image_text_fallback",
             "strict_target_coverage",
         },
         "$.runtime",
@@ -455,6 +460,10 @@ def parse_run_config(
         analysis_only=_bool(runtime_doc.get("analysis_only", True), "$.runtime.analysis_only"),
         trust_remote_code=_bool(
             runtime_doc.get("trust_remote_code", False), "$.runtime.trust_remote_code"
+        ),
+        allow_image_text_fallback=_bool(
+            runtime_doc.get("allow_image_text_fallback", False),
+            "$.runtime.allow_image_text_fallback",
         ),
         strict_target_coverage=_bool(
             runtime_doc.get("strict_target_coverage", True),
@@ -816,6 +825,8 @@ runtime:
   torch_dtype: bf16
   analysis_only: true
   trust_remote_code: false
+  # Explicit opt-in only; this does not synthesize image inputs.
+  allow_image_text_fallback: false
   strict_target_coverage: true
 
 # Empty block/include selectors defer discovery to the runtime inventory. The

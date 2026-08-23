@@ -1,3 +1,7 @@
+from dataclasses import replace
+
+import pytest
+
 from quantplan.domain import (
     GroupInventory,
     InterventionMeasurement,
@@ -129,3 +133,74 @@ def test_choose_lowest_cost_plan_uses_whole_plan_validation() -> None:
 
     assert chosen is not None
     assert chosen[1].delta_nll <= 0.02
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("baseline_nll", 2.1, "different baseline NLL"),
+        ("token_count", 127, "different token counts"),
+    ],
+)
+def test_candidate_set_rejects_measurements_that_reuse_a_context_inconsistently(
+    field: str,
+    value: float,
+    message: str,
+) -> None:
+    inventory = GroupInventory("block_0", ("layers.0.fc",), 100)
+    first = _measurement(
+        "block_0",
+        PrecisionFormat.W4A8,
+        2.2,
+        modules=inventory.module_names,
+    )
+    second = replace(
+        _measurement(
+            "block_0",
+            PrecisionFormat.W8A8,
+            2.01,
+            modules=inventory.module_names,
+        ),
+        **{field: value},
+    )
+
+    with pytest.raises(ValueError, match=message):
+        build_candidate_set(
+            (inventory,),
+            (first, second),
+            allowed_formats=(PrecisionFormat.W4A8, PrecisionFormat.W8A8),
+        )
+
+
+def test_plan_selection_rejects_mismatched_evaluation_context() -> None:
+    inventory = GroupInventory("block_0", ("layers.0.fc",), 100)
+    candidate_set = build_candidate_set(
+        (inventory,),
+        (
+            _measurement(
+                "block_0",
+                PrecisionFormat.W4A8,
+                2.01,
+                modules=inventory.module_names,
+            ),
+        ),
+        allowed_formats=(PrecisionFormat.W4A8,),
+    )
+    evaluations = tuple(
+        PlanEvaluation(
+            plan_id=plan_id(plan),
+            context_id="different-context",
+            baseline_nll=2.0,
+            candidate_nll=2.01,
+            token_count=128,
+            elapsed_seconds=1.0,
+        )
+        for plan in candidate_set.plans
+    )
+
+    with pytest.raises(ValueError, match="evaluation context mismatch"):
+        choose_lowest_cost_passing_plan(
+            candidate_set.plans,
+            evaluations,
+            max_delta_nll=0.02,
+        )

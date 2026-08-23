@@ -6,7 +6,7 @@ import hashlib
 import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from math import isfinite
+from math import isclose, isfinite
 
 from quantplan.domain import (
     CandidateEvidence,
@@ -91,6 +91,17 @@ def build_candidate_set(
     if len(context_ids) != 1:
         raise ValueError(f"measurements use different contexts: {sorted(context_ids)}")
     context_id = next(iter(context_ids))
+    baseline_nll = measured[0].baseline_nll
+    token_count = measured[0].token_count
+    for item in measured[1:]:
+        if not isclose(item.baseline_nll, baseline_nll, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(
+                "measurements with the same context_id have different baseline NLL values"
+            )
+        if item.token_count != token_count:
+            raise ValueError(
+                "measurements with the same context_id have different token counts"
+            )
 
     by_key: dict[tuple[str, PrecisionFormat], InterventionMeasurement] = {}
     evidence: list[CandidateEvidence] = []
@@ -235,10 +246,25 @@ def choose_lowest_cost_passing_plan(
     by_id = {item.plan_id: item for item in measured}
     if len(by_id) != len(measured):
         raise ValueError("duplicate plan evaluation")
+    expected_ids = {plan_id(plan) for plan in plans}
+    actual_ids = set(by_id)
+    if actual_ids != expected_ids:
+        raise ValueError(
+            "plan evaluations must cover the candidate plans exactly: "
+            f"missing={sorted(expected_ids - actual_ids)}, "
+            f"extra={sorted(actual_ids - expected_ids)}"
+        )
     passing: list[tuple[QuantPlan, PlanEvaluation]] = []
     for plan in plans:
         evaluation = by_id.get(plan_id(plan))
-        if evaluation is not None and evaluation.passes(max_delta_nll=max_delta_nll):
+        if evaluation is None:
+            raise AssertionError("validated plan ID disappeared from the evaluation index")
+        if evaluation.context_id != plan.context_id:
+            raise ValueError(
+                f"evaluation context mismatch for {evaluation.plan_id}: "
+                f"plan={plan.context_id!r}, evaluation={evaluation.context_id!r}"
+            )
+        if evaluation.passes(max_delta_nll=max_delta_nll):
             passing.append((plan, evaluation))
     if not passing:
         return None

@@ -1,8 +1,11 @@
+import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from quantplan.adapters.modelslim import inspect_modelslim_yaml
 from quantplan.artifacts import ArtifactError
 from quantplan.domain import (
     GroupInventory,
@@ -20,9 +23,7 @@ class _FakeRuntime:
             GroupInventory("block_0", ("model.layers.0.fc",), 100),
             GroupInventory("block_1", ("model.layers.1.fc",), 100),
         )
-        self.module_inventory = tuple(
-            name for group in self.groups for name in group.module_names
-        )
+        self.module_inventory = tuple(name for group in self.groups for name in group.module_names)
         self.discovered_group_count = len(self.groups)
         self.full_group_coverage = True
 
@@ -55,7 +56,7 @@ class _FakeRuntime:
             groups=self.groups,
             module_inventory=self.module_inventory,
             measurements=tuple(measurements),
-            provenance={"runtime": "toy"},
+            provenance={"runtime": "toy", "dataset_sha256": "a" * 64},
         )
 
     def evaluate_plan(self, assignments, *, plan_id):
@@ -149,6 +150,76 @@ def test_workflow_emits_yaml_only_after_a_plan_passes(tmp_path: Path) -> None:
     ) > 0
 
 
+def test_provenance_binds_selection_validation_config_and_dataset(
+    tmp_path: Path,
+) -> None:
+    config, output = _make_config(tmp_path)
+
+    result = execute_workflow(config, _FakeRuntime())
+
+    provenance = json.loads((output / "provenance.json").read_text(encoding="utf-8"))
+    binding = provenance["evidence_binding"]
+    assert binding["selected_plan_id"] == result.selected_plan_id
+    assert binding["context_id"] == "toy-context"
+    assert provenance["selected_evaluation"] == {
+        "plan_id": result.selected_plan_id,
+        "context_id": "toy-context",
+    }
+
+    validation_bytes = (output / "validation-report.json").read_bytes()
+    assert binding["validation_report"] == {
+        "path": "validation-report.json",
+        "sha256": hashlib.sha256(validation_bytes).hexdigest(),
+        "size_bytes": len(validation_bytes),
+        "hash_scope": "exact_artifact_bytes",
+    }
+    assert binding["dataset"] == {
+        "sha256": "a" * 64,
+        "source": "runtime_provenance.dataset_sha256",
+        "hash_scope": "runtime_selected_samples",
+    }
+
+    normalized_config = binding["run_config"]["normalized"]
+    assert binding["run_config"]["sha256"] == _canonical_json_sha256(normalized_config)
+    binding_without_digest = {
+        key: value for key, value in binding.items() if key != "binding_sha256"
+    }
+    assert binding["binding_sha256"] == _canonical_json_sha256(binding_without_digest)
+    assert provenance["derived_yaml_guard"]["guard_scope"] == "derived_yaml"
+    assert provenance["derived_yaml_guard"]["findings"]
+
+
+def test_yaml_audit_records_every_source_finding_and_pattern_expansion(
+    tmp_path: Path,
+) -> None:
+    config, output = _make_config(tmp_path)
+    runtime = _FakeRuntime()
+    expected = inspect_modelslim_yaml(
+        config.original_yaml,
+        module_names=runtime.module_inventory,
+    )
+
+    execute_workflow(config, runtime)
+
+    audit = json.loads((output / "yaml-audit.json").read_text(encoding="utf-8"))
+    assert audit["guard_scope"] == "source_yaml"
+    assert audit["source_size_bytes"] == config.original_yaml.stat().st_size
+    assert audit["findings"] == [
+        {"path": item.path, "status": item.status.value} for item in expected.findings
+    ]
+    assert audit["pattern_expansions"] == [
+        {
+            "field_path": item.field_path,
+            "pattern": item.pattern,
+            "matched_modules": list(item.matched_modules),
+        }
+        for item in expected.pattern_expansions
+    ]
+    assert audit["summary"]["finding_count"] == len(expected.findings)
+    assert audit["summary"]["pattern_expansion_count"] == len(expected.pattern_expansions)
+    assert sum(audit["summary"]["finding_counts"].values()) == len(expected.findings)
+
+
 def test_workflow_does_not_emit_yaml_when_no_plan_passes(tmp_path: Path) -> None:
     config, output = _make_config(tmp_path)
 
@@ -157,9 +228,7 @@ def test_workflow_does_not_emit_yaml_when_no_plan_passes(tmp_path: Path) -> None
     assert result.status == "plan_validation_failed"
     assert result.derived_yaml is None
     assert not (output / "derived-modelslim.yaml").exists()
-    assert "plan_validation_failed" in (output / "run-manifest.json").read_text(
-        encoding="utf-8"
-    )
+    assert "plan_validation_failed" in (output / "run-manifest.json").read_text(encoding="utf-8")
 
 
 def test_workflow_never_emits_yaml_for_a_pilot_subset(tmp_path: Path) -> None:
@@ -172,9 +241,7 @@ def test_workflow_never_emits_yaml_for_a_pilot_subset(tmp_path: Path) -> None:
     assert not (output / "derived-modelslim.yaml").exists()
     report = (output / "validation-report.json").read_text(encoding="utf-8")
     assert '"scope": "pilot_subset"' in report
-    assert "complete_partial_analysis" in (output / "run-manifest.json").read_text(
-        encoding="utf-8"
-    )
+    assert "complete_partial_analysis" in (output / "run-manifest.json").read_text(encoding="utf-8")
 
 
 def test_workflow_overwrite_cannot_follow_artifact_parent_symlink(
@@ -211,3 +278,14 @@ def test_workflow_never_emits_yaml_without_backend_target_mapping(
     assert not (output / "derived-modelslim.yaml").exists()
     manifest = (output / "run-manifest.json").read_text(encoding="utf-8")
     assert "unverified fused expert mapping" in manifest
+
+
+def _canonical_json_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

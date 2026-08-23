@@ -14,6 +14,8 @@ runtime:
   torch_dtype: bf16
   analysis_only: true
   trust_remote_code: false
+  # Explicit opt-in only; this does not synthesize image inputs.
+  allow_image_text_fallback: false
   strict_target_coverage: true
 
 # Empty block/include selectors defer discovery to the runtime inventory. The

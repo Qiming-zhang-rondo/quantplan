@@ -1,6 +1,25 @@
 """Public optional PyTorch analysis runtime."""
 
 from quantplan.domain.models import GroupInventory, InterventionMeasurement, PlanEvaluation
+from quantplan.runtime.architecture import (
+    ARCHITECTURE_ADAPTER_ENTRY_POINT,
+    GENERIC_ADAPTER_ID,
+    QWEN35_MODELSLIM_COMMIT,
+    QWEN35_MOE_ADAPTER_ID,
+    ArchitectureAdapter,
+    ArchitectureAdapterError,
+    ArchitectureAdapterRegistrationError,
+    ArchitectureAdapterRegistry,
+    ArchitectureAdapterResolutionError,
+    ArchitectureTargetMappingError,
+    FusedTargetMapping,
+    GenericLinearAdapter,
+    Qwen35MoeModelSlimAdapter,
+    register_architecture_adapter,
+    registered_architecture_adapters,
+    resolve_architecture_adapter,
+    unregister_architecture_adapter,
+)
 from quantplan.runtime.factory import (
     build_torch_runtime,
     expand_block_patterns,
@@ -30,15 +49,28 @@ from quantplan.runtime.torch_analysis import (
 )
 
 __all__ = [
+    "ARCHITECTURE_ADAPTER_ENTRY_POINT",
     "DEFAULT_LINEAR_EXCLUDE",
+    "GENERIC_ADAPTER_ID",
     "PROXY_SEMANTICS",
+    "QWEN35_MODELSLIM_COMMIT",
+    "QWEN35_MOE_ADAPTER_ID",
     "AnalysisRunResult",
+    "ArchitectureAdapter",
+    "ArchitectureAdapterError",
+    "ArchitectureAdapterRegistrationError",
+    "ArchitectureAdapterRegistry",
+    "ArchitectureAdapterResolutionError",
+    "ArchitectureTargetMappingError",
     "DiscoveryError",
+    "FusedTargetMapping",
+    "GenericLinearAdapter",
     "GroupInventory",
     "InterventionMeasurement",
     "ModelBundle",
     "PlanEvaluation",
     "ProgressCallback",
+    "Qwen35MoeModelSlimAdapter",
     "RuntimeProvenance",
     "TextSample",
     "TorchAnalysisError",
@@ -52,8 +84,12 @@ __all__ = [
     "load_causal_lm",
     "load_jsonl_texts",
     "plan_evaluation_to_dict",
+    "register_architecture_adapter",
+    "registered_architecture_adapters",
+    "resolve_architecture_adapter",
     "temporary_fused_expert_fake_quant",
     "temporary_group_fake_quant",
     "temporary_linear_fake_quant",
     "uniformly_select",
+    "unregister_architecture_adapter",
 ]

@@ -34,11 +34,19 @@ from quantplan.domain.models import (
     PlanEvaluation,
     PrecisionFormat,
 )
+from quantplan.runtime.architecture import (
+    BASE_SAFETY_EXCLUDES,
+    ArchitectureAdapter,
+    ArchitectureAdapterError,
+    resolve_architecture_adapter,
+)
 
 PROXY_SEMANTICS = (
     "analysis-only symmetric Linear/fused-expert fake-quant proxy; not ModelSlim-exact"
 )
-DEFAULT_LINEAR_EXCLUDE = ("*router*", "*.mlp.gate", "*mtp*", "*vision*")
+QUANTIZER_ID = "quantplan.symmetric_weight_activation_fake_quant/v1"
+CONTEXT_SCHEMA = "quantplan.torch-analysis-context/v1"
+DEFAULT_LINEAR_EXCLUDE = BASE_SAFETY_EXCLUDES
 ProgressCallback = Callable[[str, int, int, str, str], None]
 
 
@@ -86,6 +94,8 @@ class ModelBundle:
 
 @dataclass(frozen=True)
 class RuntimeProvenance:
+    context_id: str
+    context_schema: str
     runtime: str
     torch_version: str
     model_id: str
@@ -105,10 +115,14 @@ class RuntimeProvenance:
     backend_adapter: str
     group_discovery_warnings: tuple[str, ...]
     quantization_semantics: str
+    target_inventory_sha256: str
+    target_weight_dtypes: tuple[str, ...]
     created_at_utc: str
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "context_id": self.context_id,
+            "context_schema": self.context_schema,
             "runtime": self.runtime,
             "torch_version": self.torch_version,
             "model_id": self.model_id,
@@ -128,6 +142,8 @@ class RuntimeProvenance:
             "backend_adapter": self.backend_adapter,
             "group_discovery_warnings": list(self.group_discovery_warnings),
             "quantization_semantics": self.quantization_semantics,
+            "target_inventory_sha256": self.target_inventory_sha256,
+            "target_weight_dtypes": list(self.target_weight_dtypes),
             "created_at_utc": self.created_at_utc,
         }
 
@@ -180,8 +196,16 @@ class _RuntimeGroup:
 class _ExpertTarget:
     module_name: str
     parameter_names: tuple[str, ...]
-    backend_module_names: tuple[str, ...] = ()
-    backend_pattern: str | None = None
+    backend_module_names: tuple[str, ...]
+    backend_pattern: str
+    activation_kwarg: str
+
+
+@dataclass(frozen=True)
+class _BoundFusedTarget:
+    module: Any
+    parameter_names: tuple[str, ...]
+    activation_kwarg: str
 
 
 def intervention_measurement_to_dict(
@@ -388,6 +412,7 @@ def discover_transformer_blocks(
     linear_exclude: Sequence[str] = DEFAULT_LINEAR_EXCLUDE,
     max_groups: int | None = None,
     strict_targets: bool = False,
+    architecture_adapter: ArchitectureAdapter | None = None,
 ) -> tuple[GroupInventory, ...]:
     """Discover Transformer blocks and supported quantization targets.
 
@@ -404,6 +429,7 @@ def discover_transformer_blocks(
         linear_exclude=linear_exclude,
         max_groups=None,
         strict_targets=strict_targets,
+        architecture_adapter=architecture_adapter,
     )
     return tuple(
         group.inventory
@@ -419,9 +445,14 @@ def _discover_runtime_groups(
     linear_exclude: Sequence[str] = DEFAULT_LINEAR_EXCLUDE,
     max_groups: int | None = None,
     strict_targets: bool = False,
+    architecture_adapter: ArchitectureAdapter | None = None,
 ) -> tuple[_RuntimeGroup, ...]:
     torch = _require_torch()
     modules = dict(model.named_modules())
+    try:
+        adapter = architecture_adapter or resolve_architecture_adapter(model)
+    except ArchitectureAdapterError as exc:
+        raise DiscoveryError(f"architecture adapter resolution failed: {exc}") from exc
     include_patterns = _validate_patterns("linear_include", linear_include, allow_empty=False)
     configured_excludes = _validate_patterns(
         "linear_exclude", linear_exclude, allow_empty=True
@@ -429,7 +460,10 @@ def _discover_runtime_groups(
     # These patterns are safety invariants, not merely convenience defaults.  In
     # particular, a caller passing an empty configured exclude list must not make
     # router weights eligible for intervention.
-    exclude_patterns = _effective_exclude_patterns(configured_excludes)
+    exclude_patterns = _effective_exclude_patterns(
+        configured_excludes,
+        adapter=adapter,
+    )
     if max_groups is not None and max_groups < 1:
         raise ValueError("max_groups must be at least one")
     if explicit_groups is not None:
@@ -442,29 +476,21 @@ def _discover_runtime_groups(
             exclude_patterns=exclude_patterns,
             common_warnings=(
                 "explicit group discovery",
+                f"architecture adapter={adapter.adapter_id}",
                 "router exclusion is name-based only; verify the complete router path is locked",
             ),
             strict_targets=strict_targets,
+            adapter=adapter,
         )
 
-    preferred_paths = (
-        "model.language_model.layers",
-        "model.layers",
-        "model.decoder.layers",
-        "transformer.h",
-        "gpt_neox.layers",
-        "transformer.blocks",
-        "blocks",
-        "layers",
-    )
     container_path: str | None = None
-    for path in preferred_paths:
+    for path in adapter.preferred_block_paths:
         module = modules.get(path)
         if isinstance(module, torch.nn.ModuleList) and len(module) > 0:
             container_path = path
             break
 
-    if container_path is None:
+    if container_path is None and adapter.allow_block_path_fallback:
         candidates: list[tuple[int, str]] = []
         for path, module in modules.items():
             if not isinstance(module, torch.nn.ModuleList) or len(module) == 0:
@@ -481,7 +507,8 @@ def _discover_runtime_groups(
 
     if container_path is None:
         raise DiscoveryError(
-            "could not discover Transformer blocks; pass explicit_groups with named_modules paths"
+            f"architecture adapter {adapter.adapter_id!r} could not discover Transformer "
+            "blocks; pass explicit_groups with named_modules paths"
         )
 
     container = modules[container_path]
@@ -503,6 +530,7 @@ def _discover_runtime_groups(
             f"blocks at indexes {sorted(selected_indexes)}"
         )
     common_warnings = (
+        f"architecture adapter={adapter.adapter_id}",
         f"automatic block container={container_path}",
         selection_warning,
         "router exclusion is name-based only; verify the complete router path is locked",
@@ -515,6 +543,7 @@ def _discover_runtime_groups(
         exclude_patterns=exclude_patterns,
         common_warnings=common_warnings,
         strict_targets=strict_targets,
+        adapter=adapter,
     )
 
 
@@ -555,6 +584,10 @@ class TorchAnalysisRuntime:
         self.model = model
         self.tokenizer = tokenizer
         self.samples = _normalize_samples(samples)
+        try:
+            self.architecture_adapter = resolve_architecture_adapter(model)
+        except ArchitectureAdapterError as exc:
+            raise DiscoveryError(f"architecture adapter resolution failed: {exc}") from exc
         discovered_groups = _discover_runtime_groups(
             model,
             groups,
@@ -562,6 +595,7 @@ class TorchAnalysisRuntime:
             linear_exclude=linear_exclude,
             max_groups=None,
             strict_targets=strict_targets,
+            architecture_adapter=self.architecture_adapter,
         )
         self.discovered_group_count = len(discovered_groups)
         self.all_groups = tuple(group.inventory for group in discovered_groups)
@@ -571,15 +605,12 @@ class TorchAnalysisRuntime:
         )
         self.groups = tuple(group.inventory for group in self._runtime_groups)
         self.module_inventory = tuple(name for name, _ in model.named_modules())
-        self.backend_adapter = _backend_adapter_name(model)
+        self.backend_adapter = self.architecture_adapter.adapter_id
         backend_names = [name for name in self.module_inventory if name]
         unresolved_fused: list[str] = []
         for group in discovered_groups:
             for target in group.expert_targets:
-                if target.backend_module_names:
-                    backend_names.extend(target.backend_module_names)
-                else:
-                    unresolved_fused.append(target.module_name)
+                backend_names.extend(target.backend_module_names)
         self.backend_module_inventory = tuple(dict.fromkeys(backend_names))
         self.backend_compilation_ready = not unresolved_fused
         self.backend_compilation_blockers = tuple(
@@ -598,11 +629,51 @@ class TorchAnalysisRuntime:
         self.model_revision = model_revision
         self.loader_name = loader_name
         self.loader_warnings = tuple(loader_warnings)
-        self.context_id = context_id or (
-            f"torch-proxy:{model_id}:{_dataset_hash(self.samples)[:16]}"
+        if context_id is not None and (
+            not isinstance(context_id, str) or not context_id.strip()
+        ):
+            raise ValueError("context_id must be None or a non-empty string")
+        target_inventory = _selected_target_inventory(model, self._runtime_groups)
+        self.target_weight_dtypes = tuple(
+            sorted(
+                {
+                    str(target["dtype"])
+                    for group_inventory in target_inventory
+                    for target in group_inventory["targets"]
+                }
+            )
         )
-        if not self.context_id:
-            raise ValueError("context_id must not be empty")
+        _require_bf16_target_anchor(
+            self._torch,
+            target_inventory,
+        )
+        self.target_inventory_sha256 = _stable_json_hash(target_inventory)
+        context_payload = {
+            "schema": CONTEXT_SCHEMA,
+            "namespace": context_id or "torch-proxy",
+            "model": {
+                "id": str(model_id),
+                "revision": model_revision,
+                "class": f"{type(model).__module__}.{type(model).__qualname__}",
+            },
+            "tokenizer": _tokenizer_identity(tokenizer),
+            "dataset_sha256": _dataset_hash(self.samples),
+            "sample_count": len(self.samples),
+            "max_length": self.max_length,
+            "batch_size": self.batch_size,
+            "device": self.device,
+            "compute_kl": self.compute_kl,
+            "architecture_adapter_id": self.architecture_adapter.adapter_id,
+            "selected_targets": target_inventory,
+            "target_weight_dtypes": list(self.target_weight_dtypes),
+            "architecture_adapter": self.backend_adapter,
+            "quantizer_id": QUANTIZER_ID,
+            "quantization_semantics": PROXY_SEMANTICS,
+        }
+        self.context_id = (
+            f"{context_payload['namespace']}:"
+            f"{_stable_json_hash(context_payload)}"
+        )
         self._group_by_id = {
             group.inventory.group_id: group for group in self._runtime_groups
         }
@@ -687,6 +758,7 @@ class TorchAnalysisRuntime:
         if progress_callback is not None and not callable(progress_callback):
             raise TypeError("progress_callback must be callable or None")
 
+        self._assert_context_integrity()
         baseline = self._ensure_baseline()
         measurements: list[InterventionMeasurement] = []
         total = len(self._runtime_groups) * len(normalized)
@@ -733,6 +805,11 @@ class TorchAnalysisRuntime:
 
         if not assignments:
             raise ValueError("assignments must not be empty")
+        if context_id is not None and context_id != self.context_id:
+            raise ValueError(
+                "context_id override must equal the runtime experiment context"
+            )
+        self._assert_context_integrity()
         unknown = sorted(set(assignments) - set(self._group_by_id))
         if unknown:
             raise ValueError(f"unknown group IDs: {unknown}")
@@ -763,7 +840,7 @@ class TorchAnalysisRuntime:
         )
         return PlanEvaluation(
             plan_id=resolved_plan_id,
-            context_id=context_id or self.context_id,
+            context_id=self.context_id,
             baseline_nll=baseline.mean_nll,
             candidate_nll=aggregate.mean_nll,
             kl_divergence=kl,
@@ -771,6 +848,15 @@ class TorchAnalysisRuntime:
             elapsed_seconds=aggregate.elapsed_seconds,
             warnings=tuple(warnings),
         )
+
+    def _assert_context_integrity(self) -> None:
+        current = _selected_target_inventory(self.model, self._runtime_groups)
+        _require_bf16_target_anchor(self._torch, current)
+        if _stable_json_hash(current) != self.target_inventory_sha256:
+            raise TorchAnalysisError(
+                "selected quantization target inventory changed after runtime "
+                "construction; create a new runtime/context before measuring"
+            )
 
     def _evaluate_group(
         self,
@@ -796,7 +882,7 @@ class TorchAnalysisRuntime:
             kl_divergence=kl,
             token_count=aggregate.token_count,
             elapsed_seconds=aggregate.elapsed_seconds,
-            quantizer_id="quantplan.symmetric_weight_activation_fake_quant/v1",
+            quantizer_id=QUANTIZER_ID,
             warnings=(
                 *self._measurement_warnings((precision,)),
                 *group.inventory.warnings,
@@ -934,15 +1020,30 @@ class TorchAnalysisRuntime:
             for group_id, precision in assignments.items():
                 group = self._group_by_id[group_id]
                 linears = tuple(modules[name] for name in group.linear_module_names)
-                experts = tuple(modules[target.module_name] for target in group.expert_targets)
-                stack.enter_context(
-                    temporary_group_fake_quant(
-                        linears,
-                        experts,
-                        precision,
-                        torch_module=self._torch,
+                fused_targets = tuple(
+                    _BoundFusedTarget(
+                        module=modules[target.module_name],
+                        parameter_names=target.parameter_names,
+                        activation_kwarg=target.activation_kwarg,
                     )
+                    for target in group.expert_targets
                 )
+                if linears:
+                    stack.enter_context(
+                        temporary_linear_fake_quant(
+                            linears,
+                            precision,
+                            torch_module=self._torch,
+                        )
+                    )
+                if fused_targets:
+                    stack.enter_context(
+                        _temporary_fused_targets_fake_quant(
+                            fused_targets,
+                            precision,
+                            torch_module=self._torch,
+                        )
+                    )
             yield
 
     @staticmethod
@@ -965,19 +1066,12 @@ class TorchAnalysisRuntime:
             warnings.append("KL disabled; kl_divergence is null")
         if all(precision is PrecisionFormat.BF16 for precision in precisions):
             warnings.append("BF16 candidate reuses the unmodified reference forward")
-        dtypes = {
-            str(parameter.dtype)
-            for parameter in self.model.parameters()
-            if getattr(parameter, "is_floating_point", lambda: False)()
-        }
-        if dtypes and dtypes != {"torch.bfloat16"}:
-            warnings.append(
-                f"reference parameters are {sorted(dtypes)}, so 'bf16' labels the anchor semantics"
-            )
         return tuple(warnings)
 
     def _provenance(self) -> RuntimeProvenance:
         return RuntimeProvenance(
+            context_id=self.context_id,
+            context_schema=CONTEXT_SCHEMA,
             runtime="quantplan.torch_analysis/v1",
             torch_version=str(self._torch.__version__),
             model_id=self.model_id,
@@ -999,6 +1093,8 @@ class TorchAnalysisRuntime:
                 iter(warning for group in self.groups for warning in group.warnings)
             ),
             quantization_semantics=PROXY_SEMANTICS,
+            target_inventory_sha256=self.target_inventory_sha256,
+            target_weight_dtypes=self.target_weight_dtypes,
             created_at_utc=datetime.now(timezone.utc).isoformat(),
         )
 
@@ -1085,13 +1181,13 @@ def temporary_linear_fake_quant(
 
 
 @contextmanager
-def temporary_fused_expert_fake_quant(
-    expert_modules: Sequence[Any],
+def _temporary_fused_targets_fake_quant(
+    targets: Sequence[_BoundFusedTarget],
     precision: PrecisionFormat | str,
     *,
     torch_module: Any | None = None,
 ) -> Iterator[None]:
-    """Lazily QDQ Qwen-style fused expert weights and hidden states."""
+    """Lazily QDQ adapter-declared fused weights and activation inputs."""
 
     torch = torch_module or _require_torch()
     normalized = _normalize_precision(precision)
@@ -1101,9 +1197,15 @@ def temporary_fused_expert_fake_quant(
     weight_bits = 4 if normalized is PrecisionFormat.W4A8 else 8
     handles: list[Any] = []
     active_backups: dict[int, tuple[Any, tuple[tuple[str, Any], ...]]] = {}
-    unique_modules = tuple(dict.fromkeys(expert_modules))
-    if not unique_modules:
-        raise ValueError("at least one fused expert module is required")
+    target_by_id: dict[int, _BoundFusedTarget] = {}
+    for target in targets:
+        identity = id(target.module)
+        previous = target_by_id.get(identity)
+        if previous is not None and previous != target:
+            raise ValueError("one fused module received conflicting adapter mappings")
+        target_by_id[identity] = target
+    if not target_by_id:
+        raise ValueError("at least one fused target is required")
 
     def restore(module: Any) -> None:
         entry = active_backups.pop(id(module), None)
@@ -1120,6 +1222,7 @@ def temporary_fused_expert_fake_quant(
         kwargs: dict[str, Any],
     ) -> tuple[tuple[Any, ...], dict[str, Any]] | None:
         identity = id(module)
+        target = target_by_id[identity]
         if identity in active_backups:
             raise TorchAnalysisError(
                 "re-entrant fused expert fake quantization is not supported"
@@ -1127,12 +1230,12 @@ def temporary_fused_expert_fake_quant(
         backups: list[tuple[str, Any]] = []
         try:
             with torch.no_grad():
-                for parameter_name in ("gate_up_proj", "down_proj"):
+                for parameter_name in target.parameter_names:
                     parameter = getattr(module, parameter_name, None)
-                    if parameter is None or getattr(parameter, "ndim", None) != 3:
+                    if parameter is None or getattr(parameter, "ndim", 0) < 2:
                         raise TypeError(
-                            "fused expert modules must expose 3D gate_up_proj and "
-                            "down_proj parameters"
+                            "adapter-declared fused parameters must exist and have "
+                            "at least two dimensions"
                         )
                     backups.append((parameter_name, parameter.detach().clone()))
                 active_backups[identity] = (module, tuple(backups))
@@ -1148,10 +1251,10 @@ def temporary_fused_expert_fake_quant(
                     (_fake_quant_activation(torch, inputs[0], 8), *inputs[1:]),
                     kwargs,
                 )
-            hidden_states = kwargs.get("hidden_states")
+            hidden_states = kwargs.get(target.activation_kwarg)
             if hidden_states is not None and torch.is_tensor(hidden_states):
                 updated = dict(kwargs)
-                updated["hidden_states"] = _fake_quant_activation(
+                updated[target.activation_kwarg] = _fake_quant_activation(
                     torch, hidden_states, 8
                 )
                 return inputs, updated
@@ -1166,7 +1269,8 @@ def temporary_fused_expert_fake_quant(
         return output
 
     try:
-        for module in unique_modules:
+        for target in target_by_id.values():
+            module = target.module
             handles.append(
                 module.register_forward_pre_hook(
                     expert_activation_weight_hook,
@@ -1182,6 +1286,31 @@ def temporary_fused_expert_fake_quant(
         finally:
             for module, _backups in reversed(tuple(active_backups.values())):
                 restore(module)
+
+
+@contextmanager
+def temporary_fused_expert_fake_quant(
+    expert_modules: Sequence[Any],
+    precision: PrecisionFormat | str,
+    *,
+    torch_module: Any | None = None,
+) -> Iterator[None]:
+    """Backward-compatible helper for Qwen-style fused expert modules."""
+
+    targets = tuple(
+        _BoundFusedTarget(
+            module=module,
+            parameter_names=("gate_up_proj", "down_proj"),
+            activation_kwarg="hidden_states",
+        )
+        for module in expert_modules
+    )
+    with _temporary_fused_targets_fake_quant(
+        targets,
+        precision,
+        torch_module=torch_module,
+    ):
+        yield
 
 
 @contextmanager
@@ -1300,10 +1429,10 @@ def _build_runtime_groups(
     exclude_patterns: tuple[str, ...],
     common_warnings: tuple[str, ...],
     strict_targets: bool,
+    adapter: ArchitectureAdapter,
 ) -> tuple[_RuntimeGroup, ...]:
     result: list[_RuntimeGroup] = []
     seen_module_names: set[str] = set()
-    backend_adapter = _backend_adapter_name(modules.get(""))
     for group_id, module_names in groups.items():
         if not group_id:
             raise DiscoveryError("group IDs must not be empty")
@@ -1348,81 +1477,105 @@ def _build_runtime_groups(
                             expert_coverage = True
                     else:
                         excluded_target_names.append(full_name)
+                    continue
 
                 direct_parameters = dict(child.named_parameters(recurse=False))
-                expert_parameter_keys = {"gate_up_proj", "down_proj"}
-                if not (expert_parameter_keys & set(direct_parameters)):
+                matrix_parameter_names = tuple(
+                    name
+                    for name, parameter in direct_parameters.items()
+                    if getattr(parameter, "ndim", 0) >= 2
+                )
+                if not matrix_parameter_names:
                     continue
-                expert_like_module_seen = True
-                missing, wrong_rank = _classify_fused_expert_layout(direct_parameters)
-                if missing or wrong_rank:
-                    detail = (
-                        f"unsupported fused expert target {full_name}: "
-                        f"missing={missing}, non_3d={wrong_rank}"
+                module_selected = _target_selected(
+                    full_name,
+                    include_patterns,
+                    exclude_patterns,
+                )
+                selected_matrix_parameters = tuple(
+                    name
+                    for name in matrix_parameter_names
+                    if module_selected
+                    or _target_selected(
+                        f"{full_name}.{name}",
+                        include_patterns,
+                        exclude_patterns,
                     )
-                    if strict_targets:
-                        raise DiscoveryError(detail)
-                    group_warnings.append(detail)
+                )
+                if not selected_matrix_parameters:
+                    excluded_target_names.extend(
+                        f"{full_name}.{name}" for name in matrix_parameter_names
+                    )
                     continue
+                try:
+                    mapping = adapter.map_fused_target(
+                        full_name,
+                        child,
+                        direct_parameters,
+                    )
+                except ArchitectureAdapterError as exc:
+                    raise DiscoveryError(
+                        f"architecture adapter {adapter.adapter_id!r} rejected target "
+                        f"{full_name!r}: {exc}"
+                    ) from exc
+                if mapping is None:
+                    raise DiscoveryError(
+                        f"architecture adapter {adapter.adapter_id!r} does not support "
+                        f"custom matrix target {full_name!r} with parameters "
+                        f"{list(selected_matrix_parameters)}"
+                    )
                 parameter_names = tuple(
-                    f"{full_name}.{name}" for name in ("gate_up_proj", "down_proj")
+                    f"{full_name}.{name}" for name in mapping.runtime_parameter_names
                 )
-                module_included = any(
-                    fnmatchcase(full_name, pattern) for pattern in include_patterns
+                missing = tuple(
+                    name
+                    for name in mapping.runtime_parameter_names
+                    if name not in direct_parameters
                 )
-                module_excluded = any(
-                    fnmatchcase(full_name, pattern) for pattern in exclude_patterns
-                )
+                if missing:
+                    raise DiscoveryError(
+                        f"architecture adapter {adapter.adapter_id!r} mapped missing "
+                        f"parameters at {full_name!r}: {list(missing)}"
+                    )
                 selected = tuple(
                     name
                     for name in parameter_names
                     if (
-                        module_included
+                        module_selected
                         or any(fnmatchcase(name, pattern) for pattern in include_patterns)
                     )
-                    and not module_excluded
                     and not any(fnmatchcase(name, pattern) for pattern in exclude_patterns)
                 )
-                if len(selected) != 2:
+                if len(selected) != len(parameter_names):
                     excluded_target_names.extend(
                         name for name in parameter_names if name not in selected
                     )
-                    detail = (
-                        f"fused expert target {full_name} requires both gate_up_proj and "
-                        "down_proj; include/exclude selected an incomplete pair"
-                    )
-                    if selected and strict_targets:
-                        raise DiscoveryError(detail)
                     if selected:
-                        group_warnings.append(detail)
+                        raise DiscoveryError(
+                            f"architecture adapter {adapter.adapter_id!r} requires atomic "
+                            f"fused target {full_name!r}; include/exclude selected only "
+                            f"{list(selected)}"
+                        )
                     continue
-                backend_module_names, backend_pattern = _fused_backend_targets(
-                    full_name,
-                    direct_parameters,
-                    backend_adapter=backend_adapter,
-                )
                 expert_targets.append(
                     _ExpertTarget(
                         module_name=full_name,
-                        parameter_names=parameter_names,
-                        backend_module_names=backend_module_names,
-                        backend_pattern=backend_pattern,
+                        parameter_names=mapping.runtime_parameter_names,
+                        backend_module_names=mapping.backend_module_names,
+                        backend_pattern=mapping.backend_pattern,
+                        activation_kwarg=mapping.activation_kwarg,
                     )
                 )
                 quantized_target_names.append(full_name)
-                backend_patterns.append(backend_pattern or full_name)
+                backend_patterns.append(mapping.backend_pattern)
                 group_warnings.append(
                     f"fused_expert_parameters={','.join(parameter_names)}"
                 )
-                if backend_pattern is None:
-                    group_warnings.append(
-                        f"backend_mapping_unresolved={full_name}; YAML compilation is blocked"
-                    )
-                else:
-                    group_warnings.append(
-                        f"backend_mapping={full_name}->{backend_pattern} "
-                        f"({len(backend_module_names)} Linear modules)"
-                    )
+                group_warnings.append(
+                    f"backend_mapping={full_name}->{mapping.backend_pattern} "
+                    f"({len(mapping.backend_module_names)} Linear modules)"
+                )
+                expert_like_module_seen = True
                 expert_coverage = True
 
         if not quantized_target_names:
@@ -1455,7 +1608,7 @@ def _build_runtime_groups(
         parameter_count = sum(int(modules[name].weight.numel()) for name in linear_names)
         for target in expert_targets:
             expert_module = modules[target.module_name]
-            for parameter_name in ("gate_up_proj", "down_proj"):
+            for parameter_name in target.parameter_names:
                 parameter_count += int(getattr(expert_module, parameter_name).numel())
         result.append(
             _RuntimeGroup(
@@ -1573,6 +1726,99 @@ def _dataset_hash(samples: Sequence[TextSample]) -> str:
     return digest.hexdigest()
 
 
+def _stable_json_hash(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _tokenizer_identity(tokenizer: Any) -> dict[str, str | None]:
+    name_or_path = getattr(tokenizer, "name_or_path", None)
+    return {
+        "class": f"{type(tokenizer).__module__}.{type(tokenizer).__qualname__}",
+        "name_or_path": str(name_or_path) if name_or_path is not None else None,
+    }
+
+
+def _selected_target_inventory(
+    model: Any,
+    groups: Sequence[_RuntimeGroup],
+) -> tuple[dict[str, Any], ...]:
+    """Return canonical group/target metadata used by the experiment fingerprint."""
+
+    modules = dict(model.named_modules())
+    inventory: list[dict[str, Any]] = []
+    for group in groups:
+        targets: list[dict[str, Any]] = []
+        for module_name in group.linear_module_names:
+            module = modules[module_name]
+            weight = module.weight
+            targets.append(
+                {
+                    "kind": "linear_weight",
+                    "name": f"{module_name}.weight",
+                    "module_class": f"{type(module).__module__}.{type(module).__qualname__}",
+                    "shape": list(weight.shape),
+                    "dtype": str(weight.dtype),
+                }
+            )
+        for expert in group.expert_targets:
+            module = modules[expert.module_name]
+            for parameter_name in expert.parameter_names:
+                parameter = getattr(module, parameter_name)
+                targets.append(
+                    {
+                        "kind": "fused_expert_weight",
+                        "name": f"{expert.module_name}.{parameter_name}",
+                        "module_class": (
+                            f"{type(module).__module__}.{type(module).__qualname__}"
+                        ),
+                        "shape": list(parameter.shape),
+                        "dtype": str(parameter.dtype),
+                    }
+                )
+        inventory.append(
+            {
+                "group_id": group.inventory.group_id,
+                "block_module_names": list(group.block_module_names),
+                "quantized_module_names": list(group.inventory.module_names),
+                "backend_patterns": list(group.inventory.effective_backend_patterns),
+                "parameter_count": group.inventory.parameter_count,
+                "targets": targets,
+            }
+        )
+    return tuple(inventory)
+
+
+def _require_bf16_target_anchor(
+    torch: Any,
+    target_inventory: Sequence[Mapping[str, Any]],
+) -> None:
+    """Fail closed unless every selected quantization target is truly BF16."""
+
+    expected = str(torch.bfloat16)
+    mismatches = [
+        f"{target['name']}={target['dtype']}"
+        for group in target_inventory
+        for target in group["targets"]
+        if target["dtype"] != expected
+    ]
+    if not mismatches:
+        return
+    preview = ", ".join(mismatches[:8])
+    remaining = len(mismatches) - 8
+    suffix = f", ... and {remaining} more" if remaining > 0 else ""
+    raise TorchAnalysisError(
+        "BF16 protection requires every selected quantization target weight to "
+        f"be torch.bfloat16; found {preview}{suffix}. Load/cast the reference "
+        "targets as BF16 before analysis instead of treating another dtype as BF16."
+    )
+
+
 def _validate_patterns(
     name: str, values: Sequence[str], *, allow_empty: bool
 ) -> tuple[str, ...]:
@@ -1587,10 +1833,19 @@ def _validate_patterns(
     return patterns
 
 
-def _effective_exclude_patterns(configured: Sequence[str]) -> tuple[str, ...]:
+def _effective_exclude_patterns(
+    configured: Sequence[str],
+    *,
+    adapter: ArchitectureAdapter | None = None,
+) -> tuple[str, ...]:
     """Merge caller filters with non-removable runtime safety exclusions."""
 
-    return tuple(dict.fromkeys((*DEFAULT_LINEAR_EXCLUDE, *configured)))
+    required = (
+        adapter.nonremovable_exclude_patterns
+        if adapter is not None
+        else DEFAULT_LINEAR_EXCLUDE
+    )
+    return tuple(dict.fromkeys((*required, *configured)))
 
 
 def _target_selected(
@@ -1601,57 +1856,6 @@ def _target_selected(
     return any(fnmatchcase(name, pattern) for pattern in include_patterns) and not any(
         fnmatchcase(name, pattern) for pattern in exclude_patterns
     )
-
-
-def _classify_fused_expert_layout(
-    parameters: Mapping[str, Any],
-) -> tuple[list[str], list[str]]:
-    """Return missing and non-3D names for a Qwen-style fused expert target."""
-
-    expected = {"gate_up_proj", "down_proj"}
-    missing = sorted(expected - set(parameters))
-    wrong_rank = sorted(
-        name
-        for name in expected & set(parameters)
-        if getattr(parameters[name], "ndim", None) != 3
-    )
-    return missing, wrong_rank
-
-
-def _backend_adapter_name(model: Any) -> str:
-    """Return the only post-load ModelSlim mapping verified in P0."""
-
-    config = getattr(model, "config", None)
-    model_type = str(getattr(config, "model_type", "") or "").lower()
-    if model_type == "qwen3_5_moe":
-        return "modelslim.qwen3_5_moe/376e2fa"
-    return "generic"
-
-
-def _fused_backend_targets(
-    module_name: str,
-    parameters: Mapping[str, Any],
-    *,
-    backend_adapter: str,
-) -> tuple[tuple[str, ...], str | None]:
-    """Map a fused Qwen expert parent to ModelSlim's converted Linear names.
-
-    The mapping is intentionally bound to the audited Qwen3.5 adapter.  Other
-    fused layouts remain analyzable by the proxy but are not compilable to a
-    ModelSlim YAML until an architecture plug-in declares their post-adapter
-    inventory.
-    """
-
-    if backend_adapter != "modelslim.qwen3_5_moe/376e2fa":
-        return (), None
-    gate_up = parameters["gate_up_proj"]
-    expert_count = int(gate_up.shape[0])
-    names = tuple(
-        f"{module_name}.{expert_index}.{projection}"
-        for expert_index in range(expert_count)
-        for projection in ("gate_proj", "up_proj", "down_proj")
-    )
-    return names, f"{module_name}.*"
 
 
 def _uniform_indexes(total: int, count: int) -> set[int]:

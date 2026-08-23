@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import json
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -107,12 +108,8 @@ def execute_workflow(
     try:
         groups = tuple(runtime.groups)
         full_module_inventory = tuple(runtime.module_inventory)
-        discovered_group_count = int(
-            getattr(runtime, "discovered_group_count", len(groups))
-        )
-        full_group_coverage = bool(
-            getattr(runtime, "full_group_coverage", True)
-        )
+        discovered_group_count = int(getattr(runtime, "discovered_group_count", len(groups)))
+        full_group_coverage = bool(getattr(runtime, "full_group_coverage", True))
         if not groups or not full_module_inventory:
             raise RuntimeError("analysis runtime returned an empty model inventory")
         if discovered_group_count < len(groups):
@@ -141,7 +138,10 @@ def execute_workflow(
             config.original_yaml,
             module_names=full_module_inventory,
         )
-        store.write_json(config.output.yaml_audit, _guard_payload(source_guard))
+        store.write_json(
+            config.output.yaml_audit,
+            _guard_payload(source_guard, guard_scope="source_yaml"),
+        )
         if source_guard.blocked:
             codes = ", ".join(issue.code for issue in source_guard.blocking_issues)
             raise RuntimeError(f"source ModelSlim YAML failed static policy: {codes}")
@@ -241,18 +241,21 @@ def execute_workflow(
                 *(
                     []
                     if full_group_coverage
-                    else [
-                        "pilot subset does not cover every discovered block and cannot emit YAML"
-                    ]
+                    else ["pilot subset does not cover every discovered block and cannot emit YAML"]
                 ),
             ],
         }
-        store.write_json(config.output.validation_report, validation_payload)
+        validation_report_path = store.write_json(
+            config.output.validation_report,
+            validation_payload,
+        )
 
         if selected is None:
-            store.write_json(
-                config.output.provenance,
-                {"runtime": _jsonable(result.provenance)},
+            _write_provenance(
+                store,
+                config,
+                result.provenance,
+                validation_report_path=validation_report_path,
             )
             _write_manifest(
                 manifest_store,
@@ -271,9 +274,13 @@ def execute_workflow(
 
         selected_plan, selected_evaluation = selected
         if not full_group_coverage:
-            store.write_json(
-                config.output.provenance,
-                {"runtime": _jsonable(result.provenance)},
+            _write_provenance(
+                store,
+                config,
+                result.provenance,
+                validation_report_path=validation_report_path,
+                selected_plan=selected_plan,
+                selected_evaluation=selected_evaluation,
             )
             identifier = plan_id(selected_plan)
             _write_manifest(
@@ -305,16 +312,16 @@ def execute_workflow(
                 derived_yaml=None,
                 validation=selected_evaluation,
             )
-        backend_compilation_ready = bool(
-            getattr(runtime, "backend_compilation_ready", True)
-        )
+        backend_compilation_ready = bool(getattr(runtime, "backend_compilation_ready", True))
         if not backend_compilation_ready:
-            blockers = tuple(
-                getattr(runtime, "backend_compilation_blockers", ())
-            )
-            store.write_json(
-                config.output.provenance,
-                {"runtime": _jsonable(result.provenance)},
+            blockers = tuple(getattr(runtime, "backend_compilation_blockers", ()))
+            _write_provenance(
+                store,
+                config,
+                result.provenance,
+                validation_report_path=validation_report_path,
+                selected_plan=selected_plan,
+                selected_evaluation=selected_evaluation,
             )
             _write_manifest(
                 manifest_store,
@@ -396,11 +403,14 @@ def execute_workflow(
             )
         )
         store.write_text(config.output.diff, diff_text)
-        _append_compilation_provenance(
+        _write_provenance(
             store,
             config,
             result.provenance,
-            compilation,
+            validation_report_path=validation_report_path,
+            selected_plan=selected_plan,
+            selected_evaluation=selected_evaluation,
+            compilation=compilation,
             template_origins=template_origins,
         )
         _write_manifest(
@@ -459,28 +469,90 @@ def _write_manifest(
     )
 
 
-def _append_compilation_provenance(
+def _write_provenance(
     store: ArtifactStore,
     config: RunConfig,
     runtime_provenance: Any,
-    compilation: PlanCompilationResult,
     *,
-    template_origins: Mapping[PrecisionFormat, str],
+    validation_report_path: Path,
+    selected_plan: QuantPlan | None = None,
+    selected_evaluation: PlanEvaluation | None = None,
+    compilation: PlanCompilationResult | None = None,
+    template_origins: Mapping[PrecisionFormat, str] | None = None,
 ) -> None:
-    store.write_json(
-        config.output.provenance,
-        {
-            "runtime": _jsonable(runtime_provenance),
-            "modelslim_compilation": compilation.sidecar.to_dict(),
-            "template_origins": {
-                precision.value: origin
-                for precision, origin in sorted(
-                    template_origins.items(),
-                    key=lambda item: item[0].value,
-                )
-            },
-        },
-    )
+    runtime_payload = _jsonable(runtime_provenance)
+    normalized_config = _jsonable(config)
+    run_config_binding = {
+        "sha256": _canonical_sha256(normalized_config),
+        "hash_scope": "normalized_run_config",
+        "canonicalization": "json_utf8_sort_keys_compact_v1",
+        "normalized": normalized_config,
+    }
+    validation_binding = {
+        "path": str(config.output.validation_report),
+        "sha256": source_sha256(validation_report_path),
+        "size_bytes": validation_report_path.stat().st_size,
+        "hash_scope": "exact_artifact_bytes",
+    }
+    dataset_binding = _dataset_binding(config, runtime_payload)
+    evidence_binding: dict[str, Any] = {
+        "selected_plan_id": plan_id(selected_plan) if selected_plan else None,
+        "context_id": selected_plan.context_id if selected_plan else None,
+        "validation_report": validation_binding,
+        "run_config": run_config_binding,
+        "dataset": dataset_binding,
+    }
+    evidence_binding["binding_sha256"] = _canonical_sha256(evidence_binding)
+
+    payload: dict[str, Any] = {
+        "schema_version": "quantplan.provenance/v1",
+        "evidence_binding": evidence_binding,
+        "runtime": runtime_payload,
+    }
+    if selected_evaluation is not None:
+        payload["selected_evaluation"] = {
+            "plan_id": selected_evaluation.plan_id,
+            "context_id": selected_evaluation.context_id,
+        }
+    if compilation is not None:
+        payload["modelslim_compilation"] = compilation.sidecar.to_dict()
+        payload["derived_yaml_guard"] = _guard_payload(
+            compilation.output_guard,
+            guard_scope="derived_yaml",
+        )
+        payload["template_origins"] = {
+            precision.value: origin
+            for precision, origin in sorted(
+                (template_origins or {}).items(),
+                key=lambda item: item[0].value,
+            )
+        }
+    store.write_json(config.output.provenance, payload)
+
+
+def _dataset_binding(
+    config: RunConfig,
+    runtime_payload: Any,
+) -> dict[str, Any]:
+    if isinstance(runtime_payload, Mapping):
+        runtime_hash = runtime_payload.get("dataset_sha256")
+        if isinstance(runtime_hash, str) and runtime_hash:
+            return {
+                "sha256": runtime_hash,
+                "source": "runtime_provenance.dataset_sha256",
+                "hash_scope": "runtime_selected_samples",
+            }
+    if config.data_path.is_file():
+        return {
+            "sha256": source_sha256(config.data_path),
+            "source": "run_config.data_path",
+            "hash_scope": "exact_input_file_bytes",
+        }
+    return {
+        "sha256": None,
+        "source": "unavailable",
+        "hash_scope": "unavailable",
+    }
 
 
 def _measurement_payload(item: InterventionMeasurement) -> dict[str, Any]:
@@ -509,14 +581,37 @@ def _plan_payload(plan: QuantPlan) -> dict[str, Any]:
     }
 
 
-def _guard_payload(result: Any) -> dict[str, Any]:
+def _guard_payload(result: Any, *, guard_scope: str) -> dict[str, Any]:
+    finding_counts: dict[str, int] = {}
+    for finding in result.findings:
+        status = finding.status.value
+        finding_counts[status] = finding_counts.get(status, 0) + 1
     return {
+        "schema_version": "quantplan.yaml-audit/v1",
+        "guard_scope": guard_scope,
         "source_path": result.source_path,
         "source_sha256": result.source_sha256,
+        "source_size_bytes": result.source_size_bytes,
         "manifest_id": result.manifest_id,
         "static_policy_passed": result.static_policy_passed,
         "execution_readiness": result.execution_readiness,
         "execution_ready": result.execution_ready,
+        "summary": {
+            "finding_count": len(result.findings),
+            "finding_counts": finding_counts,
+            "issue_count": len(result.issues),
+            "blocking_issue_count": len(result.blocking_issues),
+            "opaque_field_count": len(result.opaque_fields),
+            "blocked_field_count": len(result.blocked_fields),
+            "pattern_expansion_count": len(result.pattern_expansions),
+        },
+        "findings": [
+            {
+                "path": finding.path,
+                "status": finding.status.value,
+            }
+            for finding in result.findings
+        ],
         "issues": [
             {
                 "code": issue.code,
@@ -545,15 +640,34 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     if is_dataclass(value) and not isinstance(value, type):
-        return _jsonable(asdict(value))
+        return {field.name: _jsonable(getattr(value, field.name)) for field in fields(value)}
     if isinstance(value, Mapping):
-        return {str(key): _jsonable(item) for key, item in value.items()}
+        return {_json_key(key): _jsonable(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_jsonable(item) for item in value]
     to_dict = getattr(value, "to_dict", None)
     if callable(to_dict):
         return _jsonable(to_dict())
     raise TypeError(f"cannot serialize {type(value).__name__} as a run artifact")
+
+
+def _json_key(value: Any) -> str:
+    if isinstance(value, Enum):
+        return str(value.value)
+    if isinstance(value, Path):
+        return str(value)
+    return str(value)
+
+
+def _canonical_sha256(value: Any) -> str:
+    canonical = json.dumps(
+        _jsonable(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _now() -> str:

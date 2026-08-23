@@ -9,6 +9,8 @@ import pytest
 from quantplan.domain.models import PrecisionFormat
 from quantplan.runtime import (
     PROXY_SEMANTICS,
+    QWEN35_MOE_ADAPTER_ID,
+    TorchAnalysisError,
     TorchAnalysisRuntime,
     TorchDependencyError,
     load_causal_lm,
@@ -97,7 +99,7 @@ def test_auto_torch_dtype_is_preserved_for_loader_semantics() -> None:
     assert torch_analysis._resolve_torch_dtype(SimpleNamespace(), "auto") == "auto"
 
 
-def test_qwen_target_helpers_keep_gate_proj_and_recognize_fused_experts() -> None:
+def test_qwen_target_filters_keep_gate_proj_and_lock_router_gate() -> None:
     include = ("*",)
     exclude = torch_analysis._effective_exclude_patterns(())
 
@@ -107,15 +109,6 @@ def test_qwen_target_helpers_keep_gate_proj_and_recognize_fused_experts() -> Non
     assert torch_analysis._target_selected(
         "model.language_model.layers.0.mlp.gate_proj", include, exclude
     )
-    assert torch_analysis._classify_fused_expert_layout(
-        {
-            "gate_up_proj": SimpleNamespace(ndim=3),
-            "down_proj": SimpleNamespace(ndim=3),
-        }
-    ) == ([], [])
-    assert torch_analysis._classify_fused_expert_layout(
-        {"gate_up_proj": SimpleNamespace(ndim=2)}
-    ) == (["down_proj"], ["gate_up_proj"])
 
 
 def test_uniform_group_selection_spans_full_depth() -> None:
@@ -126,7 +119,7 @@ def _torch_or_skip():
     return pytest.importorskip("torch", reason="optional PyTorch dependency is not installed")
 
 
-def _toy_objects(torch):
+def _toy_objects(torch, *, cast_to_bf16: bool = True):
     nn = torch.nn
 
     class ToyTokenizer:
@@ -214,7 +207,10 @@ def _toy_objects(torch):
             return SimpleNamespace(logits=self.lm_head(hidden_states))
 
     torch.manual_seed(7)
-    return ToyCausalLM(), ToyTokenizer()
+    model = ToyCausalLM()
+    if cast_to_bf16:
+        model.to(dtype=torch.bfloat16)
+    return model, ToyTokenizer()
 
 
 def _state_snapshot(model):
@@ -263,8 +259,12 @@ def test_toy_runtime_discovers_fused_experts_excludes_router_and_restores() -> N
     )
 
     assert len(result.groups) == 2
+    assert result.provenance.context_id == runtime.context_id
+    assert result.provenance.context_schema == "quantplan.torch-analysis-context/v1"
+    assert result.provenance.target_weight_dtypes == ("torch.bfloat16",)
+    assert len(result.provenance.target_inventory_sha256) == 64
     assert runtime.backend_compilation_ready is True
-    assert runtime.backend_adapter == "modelslim.qwen3_5_moe/376e2fa"
+    assert runtime.backend_adapter == QWEN35_MOE_ADAPTER_ID
     assert any(".mlp.experts.0.gate_proj" in name for name in runtime.backend_module_inventory)
     assert len(result.measurements) == 4
     for group in result.groups:
@@ -293,6 +293,80 @@ def test_toy_runtime_discovers_fused_experts_excludes_router_and_restores() -> N
     ]
     _assert_state_equal(torch, model, before)
     assert all(not module._forward_pre_hooks for module in model.modules())
+
+
+def test_runtime_context_fingerprint_binds_experiment_inputs(monkeypatch) -> None:
+    torch = _torch_or_skip()
+
+    def build(**overrides):
+        model, tokenizer = _toy_objects(torch)
+        options = {
+            "batch_size": 1,
+            "max_length": 8,
+            "max_groups": 2,
+            "model_id": "toy/qwen",
+            "model_revision": "revision-a",
+        }
+        options.update(overrides)
+        return TorchAnalysisRuntime(model, tokenizer, ["abcdef", "ghijkl"], **options)
+
+    reference = build()
+    assert build().context_id == reference.context_id
+    assert build(model_id="toy/other").context_id != reference.context_id
+    assert build(model_revision="revision-b").context_id != reference.context_id
+    assert build(max_length=6).context_id != reference.context_id
+    assert build(batch_size=2).context_id != reference.context_id
+    assert build(max_groups=1).context_id != reference.context_id
+
+    model, tokenizer = _toy_objects(torch)
+    changed_data = TorchAnalysisRuntime(
+        model,
+        tokenizer,
+        ["different"],
+        batch_size=1,
+        max_length=8,
+        max_groups=2,
+        model_id="toy/qwen",
+        model_revision="revision-a",
+    )
+    assert changed_data.context_id != reference.context_id
+
+    monkeypatch.setattr(
+        torch_analysis,
+        "PROXY_SEMANTICS",
+        f"{PROXY_SEMANTICS}; test-revision",
+    )
+    assert build().context_id != reference.context_id
+
+
+def test_runtime_rejects_non_bf16_target_anchor_but_ignores_excluded_weights() -> None:
+    torch = _torch_or_skip()
+    fp32_model, tokenizer = _toy_objects(torch, cast_to_bf16=False)
+
+    with pytest.raises(TorchAnalysisError, match="BF16 protection requires"):
+        TorchAnalysisRuntime(fp32_model, tokenizer, ["abc"], max_groups=2)
+
+    bf16_model, tokenizer = _toy_objects(torch)
+    bf16_model.model.language_model.layers[0].mlp.gate.float()
+    runtime = TorchAnalysisRuntime(bf16_model, tokenizer, ["abc"], max_groups=2)
+
+    assert runtime.target_weight_dtypes == ("torch.bfloat16",)
+
+    bf16_model.model.language_model.layers[0].mlp.gate_proj.float()
+    with pytest.raises(TorchAnalysisError, match="BF16 protection requires"):
+        runtime.run((PrecisionFormat.W4A8,))
+
+
+def test_plan_evaluation_cannot_override_runtime_context() -> None:
+    torch = _torch_or_skip()
+    model, tokenizer = _toy_objects(torch)
+    runtime = TorchAnalysisRuntime(model, tokenizer, ["abc"], max_groups=2)
+
+    with pytest.raises(ValueError, match="must equal the runtime experiment context"):
+        runtime.evaluate_plan(
+            {runtime.groups[0].group_id: PrecisionFormat.W4A8},
+            context_id="unrelated-context",
+        )
 
 
 def test_kl_is_streamed_and_plan_failure_restores_every_target() -> None:

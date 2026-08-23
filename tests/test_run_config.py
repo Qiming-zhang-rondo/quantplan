@@ -41,6 +41,7 @@ def test_minimal_config_has_conservative_defaults_and_anchors_paths(tmp_path: Pa
     assert config.runtime.loader == "huggingface"
     assert config.runtime.analysis_only is True
     assert config.runtime.trust_remote_code is False
+    assert config.runtime.allow_image_text_fallback is False
     assert config.runtime.strict_target_coverage is True
     assert config.modules.block_patterns == ()
     assert config.modules.include == ()
@@ -78,9 +79,10 @@ def test_full_config_accepts_custom_loader_selectors_candidates_and_costs(
         runtime={
             "loader": "my_project.loader:load_model",
             "revision": "commit-123",
-            "torch_dtype": "float16",
+            "torch_dtype": "auto",
             "analysis_only": False,
             "trust_remote_code": True,
+            "allow_image_text_fallback": True,
             "strict_target_coverage": False,
         },
         modules={
@@ -123,7 +125,8 @@ def test_full_config_accepts_custom_loader_selectors_candidates_and_costs(
 
     assert config.runtime.loader == "my_project.loader:load_model"
     assert config.runtime.revision == "commit-123"
-    assert config.runtime.torch_dtype == "float16"
+    assert config.runtime.torch_dtype == "auto"
+    assert config.runtime.allow_image_text_fallback is True
     assert config.runtime.strict_target_coverage is False
     assert config.modules.block_patterns == ("model.layers.*",)
     assert config.candidates.precisions == (
@@ -185,6 +188,30 @@ device: npu:0
 analysis: {max_samples: true}
 """,
             "must be an integer",
+        ),
+        (
+            """\
+schema_version: quantplan_v1
+model_path: a
+data_path: b
+original_yaml: c
+output_dir: d
+device: npu:0
+runtime: {allow_image_text_fallback: enabled}
+""",
+            "must be a boolean",
+        ),
+        (
+            """\
+schema_version: quantplan_v1
+model_path: a
+data_path: b
+original_yaml: c
+output_dir: d
+device: npu:0
+runtime: {torch_dtype: float16}
+""",
+            "cannot be labeled BF16",
         ),
         (
             """\

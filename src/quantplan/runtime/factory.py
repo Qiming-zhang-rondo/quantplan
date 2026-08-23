@@ -35,6 +35,7 @@ def build_torch_runtime(config: RunConfig) -> TorchAnalysisRuntime:
         device=config.device,
         torch_dtype=config.runtime.torch_dtype,
         trust_remote_code=config.runtime.trust_remote_code,
+        allow_image_text_fallback=config.runtime.allow_image_text_fallback,
         loader_entrypoint=loader_entrypoint,
     )
     samples = load_jsonl_texts(

@@ -21,6 +21,8 @@ QuantPlan 是面向模型量化工程师的**证据驱动混合精度规划 P0 �
 
 静态 YAML 预检通过不代表后端可执行。所有派生结果都保留 `execution_readiness: not_assessed`，直到锁定版本的 ModelSlim、CANN、推理引擎和目标硬件完成验证。
 
+P0 的保护精度语义是真实 BF16，不是“当前任意浮点模型”的别名。配置只接受 `bf16`/`bfloat16` 或 `auto`；使用 `auto` 时，运行时仍会逐个核验实际量化 target 的权重 dtype，发现 FP16/FP32 会阻断。
+
 ## 默认指标
 
 默认运行不依赖梯度。它先计算一次 BF16 teacher-forced NLL；随后对每个决策组 `g` 和候选精度 `q`，只临时 fake-quant 该组并完成整个模型前向：
@@ -82,7 +84,7 @@ quantplan init quantplan-run.yaml \
 quantplan doctor --config quantplan-run.yaml
 ```
 
-`doctor` 不加载模型权重，只检查路径、依赖、设备、候选范围和 YAML 基础结构。返回码 `0` 表示可以开始分析，`2` 表示存在阻断项。
+`doctor` 不加载模型权重，只检查路径、依赖、设备、候选范围和 YAML 基础结构。NPU 配置会实际导入 `torch_npu`，并调用 `torch.npu.is_available()` 和 `device_count()` 核对请求的卡号；无法完成探测也会给出明确的阻断原因。返回码 `0` 表示可以开始分析，`2` 表示存在阻断项。
 
 ### 4. 运行
 
@@ -135,7 +137,19 @@ runtime:
 
 自定义函数接收模型路径、revision、device、dtype 和 loader 选项，可返回 `(model, tokenizer)`、`ModelBundle`，或包含 `model/tokenizer` 的 mapping。QuantPlan 核心不依赖 ModelSlim 的内部 `core`/`infra` Python API。
 
+如果模型确实由 Transformers 的 `AutoModelForImageTextToText` 加载，但本次只验证 text-only 前向，可以显式开启受控 fallback：
+
+```yaml
+runtime:
+  loader: huggingface
+  allow_image_text_fallback: true
+```
+
+默认值为 `false`，`AutoModelForCausalLM` 失败时不会自动猜测架构。开启该选项只改变模型类 fallback，不会自动构造图片输入；如果 text-only 调用仍需要 processor 或额外参数，应使用自定义 loader。
+
 自动 Block discovery 不适配新架构时，可填写 `modules.block_patterns`。每条 pattern 必须命中，重叠和空匹配都会阻断。`modules.include/exclude` 控制组内量化 target；fused expert 必须同时覆盖 `gate_up_proj` 和 `down_proj`，不能只选一半。
+
+模型结构通过版本化 `ArchitectureAdapter` 插件隔离。Qwen3.5 MoE 是首个已审计映射；GLM、DeepSeek、Kimi 必须按代际分别提供 Block 发现、安全锁定和后端 target 映射插件，当前不能据此宣称已支持。外部包可通过 `quantplan.architecture_adapters` entry point 接入，未知或歧义 custom/fused op 会阻断。完整合同见 [`docs/architecture-adapters.md`](docs/architecture-adapters.md)。
 
 ## 输出产物
 
