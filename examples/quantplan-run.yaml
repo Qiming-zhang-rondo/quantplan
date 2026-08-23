@@ -1,0 +1,58 @@
+schema_version: quantplan_v1
+
+# Required: replace every REPLACE_WITH_* value before calling validate_for_run().
+model_path: REPLACE_WITH_MODEL_PATH
+data_path: REPLACE_WITH_DATA_PATH
+original_yaml: REPLACE_WITH_ORIGINAL_MODELSLIM_YAML
+output_dir: REPLACE_WITH_OUTPUT_DIRECTORY
+device: REPLACE_WITH_DEVICE  # Example: npu:0
+
+# Optional conservative defaults. A custom loader must use module:function syntax.
+runtime:
+  loader: huggingface
+  revision: null
+  torch_dtype: bf16
+  analysis_only: true
+  trust_remote_code: false
+  strict_target_coverage: true
+
+# Empty block/include selectors defer discovery to the runtime inventory. The
+# conservative excludes remain locked, and unknown target coverage fails closed.
+modules:
+  block_patterns: []
+  include: []
+  exclude: ["*vision*", "*visual*", "*mtp*", "*.mlp.gate", "*router*"]
+
+# Candidate presence is a hypothesis, not a backend support claim.
+candidates:
+  precisions: [w4a8, w8a8]
+
+analysis:
+  max_samples: 16
+  max_length: 512
+  batch_size: 1
+  max_groups: 8
+  compute_kl: false
+  text_field: text
+  id_field: id
+  seed: 20260817
+
+search:
+  base_precision: w4a8
+  high_precision_fraction: 0.25
+  max_candidates: 8
+  max_delta_nll: 0.02
+  # Normalized planning proxies, not measured hardware latency or memory.
+  costs: {w4a4: 0.75, w4a8: 1.0, w8a8: 1.5, bf16: 2.5}
+
+# Relative paths are confined under output_dir.
+output:
+  model_inventory: model-inventory.json
+  risk_evidence: risk-evidence.jsonl
+  candidate_plan: candidate-plan.json
+  validation_report: validation-report.json
+  derived_yaml: derived-modelslim.yaml
+  provenance: provenance.json
+  diff: plan.diff
+  yaml_audit: yaml-audit.json
+  run_manifest: run-manifest.json

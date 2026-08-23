@@ -10,9 +10,10 @@ from enum import Enum
 class UnknownFieldStatus(str, Enum):
     """How the guard treats a field at a pinned capability boundary.
 
-    ``OPAQUE`` means the field is retained as evidence but is not interpreted or
-    copied into a generated execution plan. ``BLOCKING`` means execution cannot
-    be declared safe until a capability plug-in explicitly understands it.
+    ``OPAQUE`` means the field is retained unchanged and recorded as evidence,
+    but is never interpreted or synthesized by QuantPlan. ``BLOCKING`` means
+    execution cannot be declared safe until a capability plug-in explicitly
+    understands it.
     """
 
     KNOWN = "known"
@@ -156,7 +157,7 @@ class CapabilityManifest:
     )
     # Only the conservative built-in combination is accepted by default.
     # A pinned plug-in manifest may extend this set after registry probing.
-    quantizer_methods: frozenset[str] = frozenset({"minmax"})
+    quantizer_methods: frozenset[str] = frozenset({"minmax", "ssz"})
     runner_values: frozenset[str] = frozenset(
         {"auto", "model_wise", "layer_wise", "dp_layer_wise"}
     )
@@ -361,7 +362,7 @@ def default_modelslim_manifest() -> CapabilityManifest:
 
     manifest.register_saver_type(
         "ascendv1_saver",
-        allowed_fields={"part_file_size", "save_directory"},
+        allowed_fields={"part_file_size", "save_directory", "ext"},
     )
     return manifest
 

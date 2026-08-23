@@ -365,17 +365,23 @@ class _Inspection:
                 _render_path((*path, "score")),
                 "metadata.score must be numeric",
             )
-        for field_name in ("verified_model_types", "verified_tags"):
-            field_value = value.get(field_name)
-            if field_value is not None and (
-                not isinstance(field_value, list)
-                or not all(isinstance(item, str) for item in field_value)
-            ):
-                self.block(
-                    "metadata_list_invalid",
-                    _render_path((*path, field_name)),
-                    f"metadata.{field_name} must be a list of strings",
-                )
+        verified_model_types = value.get("verified_model_types")
+        if verified_model_types is not None and (
+            not isinstance(verified_model_types, list)
+            or not all(isinstance(item, str) for item in verified_model_types)
+        ):
+            self.block(
+                "metadata_list_invalid",
+                _render_path((*path, "verified_model_types")),
+                "metadata.verified_model_types must be a list of strings",
+            )
+        verified_tags = value.get("verified_tags")
+        if verified_tags is not None and not _valid_verified_tags(verified_tags):
+            self.block(
+                "metadata_verified_tags_invalid",
+                _render_path((*path, "verified_tags")),
+                "metadata.verified_tags must be a string list or model-to-tag matrix mapping",
+            )
         if label is None:
             return
         if not isinstance(label, Mapping):
@@ -924,6 +930,12 @@ class _Inspection:
                     _render_path((*saver_path, "save_directory")),
                     "save_directory must be a non-empty string",
                 )
+            if "ext" in saver and not isinstance(saver["ext"], Mapping):
+                self.block(
+                    "saver_ext_invalid",
+                    _render_path((*saver_path, "ext")),
+                    "saver ext must be a mapping",
+                )
 
     def _inspect_capability_status(
         self,
@@ -983,6 +995,27 @@ class _Inspection:
                     field_path,
                     "field is not declared at this semantic capability boundary",
                 )
+
+
+def _valid_verified_tags(value: Any, *, depth: int = 0) -> bool:
+    """Validate the two verified_tags shapes used by audited lab practices."""
+
+    if depth > 4:
+        return False
+    if isinstance(value, str):
+        return bool(value)
+    if isinstance(value, list):
+        return bool(value) and all(
+            _valid_verified_tags(item, depth=depth + 1) for item in value
+        )
+    if isinstance(value, Mapping):
+        return bool(value) and all(
+            isinstance(key, str)
+            and bool(key)
+            and _valid_verified_tags(item, depth=depth + 1)
+            for key, item in value.items()
+        )
+    return False
 
 
 def inspect_modelslim_yaml(

@@ -469,3 +469,37 @@ def test_brace_patterns_require_pinned_backend_dialect(tmp_path: Path) -> None:
         issue.code == "pattern_dialect_unsupported"
         for issue in result.blocking_issues
     )
+
+
+def test_audited_official_metadata_ssz_and_saver_ext_are_accepted(
+    tmp_path: Path,
+) -> None:
+    document = _linear_document()
+    document["metadata"].update(
+        {
+            "verified_model_types": ["qwen3_5_moe"],
+            "verified_tags": {
+                "Qwen3.5-35B-A3B": [["vllm-ascend", "Ascend950"]]
+            },
+        }
+    )
+    process = document["spec"]["process"][0]
+    process["include"] = ["model.layers.*.mlp.experts*"]
+    process["qconfig"]["weight"]["dtype"] = "int4"
+    process["qconfig"]["weight"]["method"] = "ssz"
+    document["spec"]["save"] = [
+        {
+            "type": "ascendv1_saver",
+            "save_directory": "output",
+            "ext": {"model_quant_type": "W4A8"},
+        }
+    ]
+    source = _write_yaml(tmp_path / "official-shaped.yaml", document)
+
+    result = inspect_modelslim_yaml(
+        source,
+        module_names=("model.layers.0.mlp.experts.0.gate_proj",),
+    )
+
+    assert result.static_policy_passed
+    assert not result.execution_ready

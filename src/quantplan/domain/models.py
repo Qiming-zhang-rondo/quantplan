@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from math import isfinite
+from math import isclose, isfinite
 
 
 class PrecisionFormat(str, Enum):
@@ -84,6 +84,126 @@ class CandidateEvidence:
             value = getattr(self, name)
             if value is not None and (not isfinite(value) or not 0 <= value <= 1):
                 raise ValueError(f"{name} must be finite and in [0, 1]")
+
+
+@dataclass(frozen=True)
+class GroupInventory:
+    """A runtime-discovered decision group and its quantizable module inventory."""
+
+    group_id: str
+    module_names: tuple[str, ...]
+    parameter_count: int
+    kind: str = "transformer_block"
+    warnings: tuple[str, ...] = ()
+    backend_patterns: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.group_id:
+            raise ValueError("group_id must not be empty")
+        if not self.module_names:
+            raise ValueError(f"group inventory {self.group_id!r} has no modules")
+        if self.parameter_count < 1:
+            raise ValueError("parameter_count must be positive")
+        if self.backend_patterns and (
+            len(self.backend_patterns) != len(self.module_names)
+            or any(not pattern for pattern in self.backend_patterns)
+        ):
+            raise ValueError(
+                "backend_patterns must be empty or align one-to-one with module_names"
+            )
+
+    @property
+    def effective_backend_patterns(self) -> tuple[str, ...]:
+        return self.backend_patterns or self.module_names
+
+
+@dataclass(frozen=True)
+class InterventionMeasurement:
+    """Whole-model evidence from quantizing one group with one candidate.
+
+    ``candidate_nll`` is measured after the complete model forward, so the
+    value includes propagation through residual paths, normalization layers
+    and all downstream blocks.  It is still conditional on the declared
+    proxy/backend quantizer and workload.
+    """
+
+    group_id: str
+    precision: PrecisionFormat
+    context_id: str
+    module_names: tuple[str, ...]
+    parameter_count: int
+    baseline_nll: float
+    candidate_nll: float
+    token_count: int
+    elapsed_seconds: float
+    quantizer_id: str
+    kl_divergence: float | None = None
+    warnings: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.group_id or not self.context_id or not self.quantizer_id:
+            raise ValueError("group_id, context_id and quantizer_id must not be empty")
+        if not self.module_names:
+            raise ValueError("module_names must not be empty")
+        if self.parameter_count < 1:
+            raise ValueError("parameter_count must be positive")
+        if self.token_count < 1:
+            raise ValueError("token_count must be positive")
+        for name in ("baseline_nll", "candidate_nll", "elapsed_seconds"):
+            value = getattr(self, name)
+            if not isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if self.kl_divergence is not None and (
+            not isfinite(self.kl_divergence) or self.kl_divergence < 0
+        ):
+            raise ValueError("kl_divergence must be finite and non-negative")
+
+    @property
+    def delta_nll(self) -> float:
+        """Observed candidate-minus-BF16 teacher-forced NLL per token."""
+
+        return self.candidate_nll - self.baseline_nll
+
+
+@dataclass(frozen=True)
+class PlanEvaluation:
+    """Whole-model validation of one complete mixed-precision assignment."""
+
+    plan_id: str
+    context_id: str
+    baseline_nll: float
+    candidate_nll: float
+    token_count: int
+    elapsed_seconds: float
+    kl_divergence: float | None = None
+    warnings: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.plan_id or not self.context_id:
+            raise ValueError("plan_id and context_id must not be empty")
+        if self.token_count < 1:
+            raise ValueError("token_count must be positive")
+        for name in ("baseline_nll", "candidate_nll", "elapsed_seconds"):
+            value = getattr(self, name)
+            if not isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if self.kl_divergence is not None and (
+            not isfinite(self.kl_divergence) or self.kl_divergence < 0
+        ):
+            raise ValueError("kl_divergence must be finite and non-negative")
+
+    @property
+    def delta_nll(self) -> float:
+        return self.candidate_nll - self.baseline_nll
+
+    def passes(self, *, max_delta_nll: float, tolerance: float = 1e-12) -> bool:
+        if not isfinite(max_delta_nll) or max_delta_nll < 0:
+            raise ValueError("max_delta_nll must be finite and non-negative")
+        return self.delta_nll < max_delta_nll or isclose(
+            self.delta_nll,
+            max_delta_nll,
+            abs_tol=tolerance,
+        )
 
 
 @dataclass(frozen=True)

@@ -1,0 +1,131 @@
+from quantplan.domain import (
+    GroupInventory,
+    InterventionMeasurement,
+    PlanEvaluation,
+    PrecisionFormat,
+)
+from quantplan.planning import (
+    PlanningPolicy,
+    build_candidate_set,
+    choose_lowest_cost_passing_plan,
+    plan_id,
+)
+
+
+def _measurement(
+    group_id: str,
+    precision: PrecisionFormat,
+    candidate_nll: float,
+    *,
+    modules: tuple[str, ...],
+) -> InterventionMeasurement:
+    return InterventionMeasurement(
+        group_id=group_id,
+        precision=precision,
+        context_id="ctx",
+        module_names=modules,
+        parameter_count=100,
+        baseline_nll=2.0,
+        candidate_nll=candidate_nll,
+        token_count=128,
+        elapsed_seconds=1.0,
+        quantizer_id="torch-uniform-proxy-v1",
+    )
+
+
+def test_candidate_set_prioritizes_the_sensitive_group() -> None:
+    inventories = (
+        GroupInventory("block_0", ("layers.0.fc",), 100),
+        GroupInventory("block_1", ("layers.1.fc",), 100),
+    )
+    measurements = (
+        _measurement(
+            "block_0", PrecisionFormat.W4A8, 2.2, modules=("layers.0.fc",)
+        ),
+        _measurement(
+            "block_0", PrecisionFormat.W8A8, 2.01, modules=("layers.0.fc",)
+        ),
+        _measurement(
+            "block_1", PrecisionFormat.W4A8, 2.04, modules=("layers.1.fc",)
+        ),
+        _measurement(
+            "block_1", PrecisionFormat.W8A8, 2.02, modules=("layers.1.fc",)
+        ),
+    )
+
+    result = build_candidate_set(
+        inventories,
+        measurements,
+        allowed_formats=(PrecisionFormat.W4A8, PrecisionFormat.W8A8),
+        policy=PlanningPolicy(max_high_precision_fraction=0.2, max_candidates=3),
+    )
+
+    assert result.plans
+    best = result.plans[-1]
+    assert best.assignments["block_0"] is PrecisionFormat.W8A8
+    assert best.assignments["block_1"] is PrecisionFormat.W4A8
+
+
+def test_negative_delta_is_kept_only_as_a_warning_for_planning() -> None:
+    inventory = GroupInventory("block_0", ("layers.0.fc",), 100)
+    result = build_candidate_set(
+        (inventory,),
+        (
+            _measurement(
+                "block_0",
+                PrecisionFormat.W4A8,
+                1.99,
+                modules=inventory.module_names,
+            ),
+        ),
+        allowed_formats=(PrecisionFormat.W4A8,),
+    )
+
+    w4 = next(
+        item for item in result.evidence if item.precision is PrecisionFormat.W4A8
+    )
+    assert w4.risk == 0
+    assert "negative delta NLL" in w4.warnings[0]
+
+
+def test_choose_lowest_cost_plan_uses_whole_plan_validation() -> None:
+    inventory = GroupInventory("block_0", ("layers.0.fc",), 100)
+    result = build_candidate_set(
+        (inventory,),
+        (
+            _measurement(
+                "block_0",
+                PrecisionFormat.W4A8,
+                2.2,
+                modules=inventory.module_names,
+            ),
+            _measurement(
+                "block_0",
+                PrecisionFormat.W8A8,
+                2.01,
+                modules=inventory.module_names,
+            ),
+        ),
+        allowed_formats=(PrecisionFormat.W4A8, PrecisionFormat.W8A8),
+        policy=PlanningPolicy(max_high_precision_fraction=1.0, max_candidates=3),
+    )
+    evaluations = tuple(
+        PlanEvaluation(
+            plan_id=plan_id(plan),
+            context_id="ctx",
+            baseline_nll=2.0,
+            candidate_nll=(2.1 if index == 0 else 2.01),
+            token_count=128,
+            elapsed_seconds=1.0,
+        )
+        for index, plan in enumerate(result.plans)
+    )
+
+    chosen = choose_lowest_cost_passing_plan(
+        result.plans,
+        evaluations,
+        max_delta_nll=0.02,
+    )
+
+    assert chosen is not None
+    assert chosen[1].delta_nll <= 0.02

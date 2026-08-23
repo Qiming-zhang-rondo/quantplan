@@ -9,7 +9,6 @@ description = "Evidence-driven mixed-precision planning for ModelSlim-compatible
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "numpy>=1.26",
   "PyYAML>=6.0",
 ]
 
@@ -19,8 +18,15 @@ Issues = "https://github.com/Qiming-zhang-rondo/quantplan/issues"
 
 [project.optional-dependencies]
 dev = [
+  "numpy>=1.26",
   "pytest>=8.0",
   "ruff>=0.6",
+]
+research = [
+  "numpy>=1.26",
+]
+runtime-test = [
+  "torch>=2.2",
 ]
 
 [project.scripts]
