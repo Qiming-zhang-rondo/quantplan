@@ -71,6 +71,7 @@ def test_registry_prefers_exact_qwen_adapter_and_keeps_generic_fallback() -> Non
 
     assert registry.resolve(_model()).adapter_id == GENERIC_ADAPTER_ID
     assert registry.resolve(_model("qwen3_5_moe")).adapter_id == QWEN35_MOE_ADAPTER_ID
+    assert registry.resolve(_model("qwen3_5_moe_text")).adapter_id == QWEN35_MOE_ADAPTER_ID
 
 
 def test_qwen_adapter_maps_fused_runtime_weights_to_audited_backend_names() -> None:

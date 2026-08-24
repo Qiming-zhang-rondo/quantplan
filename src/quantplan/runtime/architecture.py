@@ -151,7 +151,7 @@ class Qwen35MoeModelSlimAdapter:
     def matches(self, model: Any, config: Any | None = None) -> bool:
         resolved_config = config if config is not None else getattr(model, "config", None)
         model_type = str(getattr(resolved_config, "model_type", "") or "").lower()
-        return model_type == "qwen3_5_moe"
+        return model_type in ("qwen3_5_moe", "qwen3_5_moe_text")
 
     def map_fused_target(
         self,
