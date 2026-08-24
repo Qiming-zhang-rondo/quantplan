@@ -5,6 +5,7 @@ import pytest
 
 from quantplan.run_config import loads_run_config
 from quantplan.runtime.factory import (
+    _runtime_device_constraint,
     build_torch_runtime,
     expand_block_patterns,
     uniformly_select,
@@ -32,6 +33,13 @@ def test_uniform_selection_covers_depth_boundaries() -> None:
     assert len(selected) == 8
     assert selected[0] == "layer.0"
     assert selected[-1] == "layer.39"
+
+
+def test_explicit_placement_remains_authoritative_but_typed_auto_keeps_backend() -> None:
+    assert _runtime_device_constraint("npu:0", has_placement=True) is None
+    assert _runtime_device_constraint("npu:auto", has_placement=True) == "npu:auto"
+    assert _runtime_device_constraint("auto", has_placement=True) is None
+    assert _runtime_device_constraint("npu:0", has_placement=False) == "npu:0"
 
 
 def test_build_runtime_forwards_explicit_image_text_fallback(tmp_path: Path) -> None:

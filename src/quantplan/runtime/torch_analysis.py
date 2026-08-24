@@ -45,9 +45,12 @@ PROXY_SEMANTICS = (
     "analysis-only symmetric Linear/fused-expert fake-quant proxy; not ModelSlim-exact"
 )
 QUANTIZER_ID = "quantplan.symmetric_weight_activation_fake_quant/v1"
-CONTEXT_SCHEMA = "quantplan.torch-analysis-context/v1"
+CONTEXT_SCHEMA = "quantplan.torch-analysis-context/v2"
+PLACEMENT_SCHEMA = "quantplan.model-placement/v1"
 DEFAULT_LINEAR_EXCLUDE = BASE_SAFETY_EXCLUDES
 ProgressCallback = Callable[[str, int, int, str, str], None]
+
+_PLACEMENT_STRATEGIES = frozenset({"single_device", "hf_device_map", "pre_sharded"})
 
 
 class TorchAnalysisError(RuntimeError):
@@ -81,6 +84,50 @@ class TextSample:
 
 
 @dataclass(frozen=True)
+class ModelPlacement:
+    """Declared one-process model placement contract.
+
+    ``hf_device_map`` and ``pre_sharded`` mean that complete modules are
+    resident on one of several accelerator devices and the loaded model owns
+    activation transfers between them.  CPU/disk offload, meta parameters,
+    tensor parallelism and multi-process execution are intentionally outside
+    this contract.
+    """
+
+    strategy: str
+    input_device: str | None = None
+    device_map: tuple[tuple[str, str], ...] | Mapping[str, str] = ()
+
+    def __post_init__(self) -> None:
+        if self.strategy not in _PLACEMENT_STRATEGIES:
+            allowed = ", ".join(sorted(_PLACEMENT_STRATEGIES))
+            raise ValueError(f"placement strategy must be one of {allowed}; got {self.strategy!r}")
+        if self.input_device is not None and (
+            not isinstance(self.input_device, str) or not self.input_device.strip()
+        ):
+            raise ValueError("placement input_device must be null or a non-empty string")
+        normalized_map: list[tuple[str, str]] = []
+        entries = self.device_map.items() if isinstance(self.device_map, Mapping) else self.device_map
+        for module_name, device in entries:
+            if not isinstance(module_name, str) or not isinstance(device, str):
+                raise TypeError("placement device_map entries must be string pairs")
+            if not device.strip():
+                raise ValueError("placement device_map devices must not be empty")
+            normalized_map.append((module_name, device.strip()))
+        if len({name for name, _ in normalized_map}) != len(normalized_map):
+            raise ValueError("placement device_map module names must be unique")
+        object.__setattr__(self, "device_map", tuple(sorted(normalized_map)))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": PLACEMENT_SCHEMA,
+            "strategy": self.strategy,
+            "input_device": self.input_device,
+            "device_map": dict(self.device_map),
+        }
+
+
+@dataclass(frozen=True)
 class ModelBundle:
     """Objects returned by either the built-in HF loader or a custom loader."""
 
@@ -90,6 +137,7 @@ class ModelBundle:
     revision: str | None = None
     loader_name: str = "custom"
     warnings: tuple[str, ...] = ()
+    placement: ModelPlacement | None = None
 
 
 @dataclass(frozen=True)
@@ -103,6 +151,11 @@ class RuntimeProvenance:
     loader_name: str
     loader_warnings: tuple[str, ...]
     device: str
+    placement_schema: str
+    placement_strategy: str
+    model_devices: tuple[str, ...]
+    target_devices: tuple[str, ...]
+    placement_sha256: str
     dataset_sha256: str
     sample_count: int
     batch_size: int
@@ -130,6 +183,11 @@ class RuntimeProvenance:
             "loader_name": self.loader_name,
             "loader_warnings": list(self.loader_warnings),
             "device": self.device,
+            "placement_schema": self.placement_schema,
+            "placement_strategy": self.placement_strategy,
+            "model_devices": list(self.model_devices),
+            "target_devices": list(self.target_devices),
+            "placement_sha256": self.placement_sha256,
             "dataset_sha256": self.dataset_sha256,
             "sample_count": self.sample_count,
             "batch_size": self.batch_size,
@@ -182,6 +240,15 @@ class _ForwardAggregate:
         if self.token_count <= 0:
             raise TorchAnalysisError("teacher-forced evaluation produced no target tokens")
         return self.nll_sum / self.token_count
+
+
+@dataclass(frozen=True)
+class _ResolvedPlacement:
+    placement: ModelPlacement
+    input_device: str
+    model_devices: tuple[str, ...]
+    target_devices: tuple[str, ...]
+    sha256: str
 
 
 @dataclass(frozen=True)
@@ -276,9 +343,7 @@ def load_jsonl_texts(
             raise ValueError(f"{source}:{line_number}: duplicate sample id {sample_id!r}")
         seen_ids.add(sample_id)
         metadata = {
-            key: value
-            for key, value in record.items()
-            if key not in {text_field, id_field}
+            key: value for key, value in record.items() if key not in {text_field, id_field}
         }
         samples.append(TextSample(sample_id=sample_id, text=text, metadata=metadata))
         if limit is not None and len(samples) >= limit:
@@ -308,6 +373,9 @@ def load_causal_lm(
     """
 
     torch = _require_torch()
+    if isinstance(device, str) and _device_kind(device) == "npu":
+        _require_torch_npu()
+    auto_placement = _is_auto_device(device)
     resolved_dtype = _resolve_torch_dtype(torch, torch_dtype)
     model_options = dict(model_kwargs or {})
     tokenizer_options = dict(tokenizer_kwargs or {})
@@ -332,6 +400,12 @@ def load_causal_lm(
         )
     else:
         transformers = _require_transformers()
+        configured_device_map = model_options.get("device_map")
+        if device is not None and not auto_placement and configured_device_map is not None:
+            raise TorchAnalysisError(
+                "an explicit device cannot be combined with model_kwargs.device_map; "
+                "use device='auto' for resident module sharding"
+            )
         if revision is not None:
             model_options.setdefault("revision", revision)
             tokenizer_options.setdefault("revision", revision)
@@ -339,7 +413,7 @@ def load_causal_lm(
         tokenizer_options.setdefault("trust_remote_code", trust_remote_code)
         if resolved_dtype is not None:
             model_options.setdefault("torch_dtype", resolved_dtype)
-        if device == "auto":
+        if auto_placement:
             model_options.setdefault("device_map", "auto")
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             model_name_or_path, **tokenizer_options
@@ -365,9 +439,7 @@ def load_causal_lm(
                     f"{causal_error}"
                 ) from causal_error
             try:
-                model = image_text_loader.from_pretrained(
-                    model_name_or_path, **model_options
-                )
+                model = image_text_loader.from_pretrained(model_name_or_path, **model_options)
             except Exception as image_text_error:  # noqa: BLE001 - third-party loader boundary
                 raise TorchAnalysisError(
                     "AutoModelForCausalLM failed, then the explicitly enabled "
@@ -379,7 +451,7 @@ def load_causal_lm(
             loader_warnings.append(
                 "used explicit image-text architecture fallback for text-only analysis"
             )
-        if device not in {None, "auto"}:
+        if device is not None and not auto_placement:
             model.to(device)
         if getattr(tokenizer, "pad_token_id", None) is None:
             eos_token = getattr(tokenizer, "eos_token", None)
@@ -390,6 +462,17 @@ def load_causal_lm(
                 )
             tokenizer.pad_token = eos_token
             loader_warnings.append("tokenizer pad_token was set to eos_token for batching")
+        placement = _placement_from_loaded_model(
+            model,
+            requested_device=device,
+            hf_auto=auto_placement or configured_device_map is not None,
+        )
+        if placement.strategy == "hf_device_map":
+            loader_warnings.append(
+                "Hugging Face device_map placement is accepted only for fully resident "
+                "one-process module sharding; runtime validation rejects CPU/disk/meta "
+                "offload and does not support TP/FSDP/EP"
+            )
         bundle = ModelBundle(
             model=model,
             tokenizer=tokenizer,
@@ -397,6 +480,7 @@ def load_causal_lm(
             revision=revision,
             loader_name=loader_name,
             warnings=tuple(loader_warnings),
+            placement=placement,
         )
 
     if hasattr(bundle.model, "eval"):
@@ -431,10 +515,7 @@ def discover_transformer_blocks(
         strict_targets=strict_targets,
         architecture_adapter=architecture_adapter,
     )
-    return tuple(
-        group.inventory
-        for group in _select_runtime_groups(discovered, max_groups)
-    )
+    return tuple(group.inventory for group in _select_runtime_groups(discovered, max_groups))
 
 
 def _discover_runtime_groups(
@@ -454,9 +535,7 @@ def _discover_runtime_groups(
     except ArchitectureAdapterError as exc:
         raise DiscoveryError(f"architecture adapter resolution failed: {exc}") from exc
     include_patterns = _validate_patterns("linear_include", linear_include, allow_empty=False)
-    configured_excludes = _validate_patterns(
-        "linear_exclude", linear_exclude, allow_empty=True
-    )
+    configured_excludes = _validate_patterns("linear_exclude", linear_exclude, allow_empty=True)
     # These patterns are safety invariants, not merely convenience defaults.  In
     # particular, a caller passing an empty configured exclude list must not make
     # router weights eligible for intervention.
@@ -496,9 +575,7 @@ def _discover_runtime_groups(
             if not isinstance(module, torch.nn.ModuleList) or len(module) == 0:
                 continue
             linear_count = sum(
-                1
-                for child in module.modules()
-                if isinstance(child, torch.nn.Linear)
+                1 for child in module.modules() if isinstance(child, torch.nn.Linear)
             )
             if linear_count:
                 candidates.append((len(module), path))
@@ -569,6 +646,7 @@ class TorchAnalysisRuntime:
         model_revision: str | None = None,
         loader_name: str = "provided-objects",
         loader_warnings: Sequence[str] = (),
+        placement: ModelPlacement | None = None,
         context_id: str | None = None,
     ) -> None:
         self._torch = _require_torch()
@@ -600,9 +678,7 @@ class TorchAnalysisRuntime:
         self.discovered_group_count = len(discovered_groups)
         self.all_groups = tuple(group.inventory for group in discovered_groups)
         self._runtime_groups = _select_runtime_groups(discovered_groups, max_groups)
-        self.full_group_coverage = (
-            len(self._runtime_groups) == self.discovered_group_count
-        )
+        self.full_group_coverage = len(self._runtime_groups) == self.discovered_group_count
         self.groups = tuple(group.inventory for group in self._runtime_groups)
         self.module_inventory = tuple(name for name, _ in model.named_modules())
         self.backend_adapter = self.architecture_adapter.adapter_id
@@ -619,21 +695,26 @@ class TorchAnalysisRuntime:
         )
         self.batch_size = batch_size
         self.max_length = max_length
-        self.device = (
-            str(_model_input_device(self._torch, model))
-            if device in {None, "auto"}
-            else str(device)
-        )
         self.compute_kl = bool(compute_kl)
         self.model_id = model_id
         self.model_revision = model_revision
         self.loader_name = loader_name
         self.loader_warnings = tuple(loader_warnings)
-        if context_id is not None and (
-            not isinstance(context_id, str) or not context_id.strip()
-        ):
+        if context_id is not None and (not isinstance(context_id, str) or not context_id.strip()):
             raise ValueError("context_id must be None or a non-empty string")
         target_inventory = _selected_target_inventory(model, self._runtime_groups)
+        resolved_placement = _resolve_runtime_placement(
+            self._torch,
+            model,
+            target_inventory,
+            declared=placement,
+            requested_device=device,
+        )
+        self.placement = resolved_placement.placement
+        self.device = resolved_placement.input_device
+        self.model_devices = resolved_placement.model_devices
+        self.target_devices = resolved_placement.target_devices
+        self.placement_sha256 = resolved_placement.sha256
         self.target_weight_dtypes = tuple(
             sorted(
                 {
@@ -648,35 +729,11 @@ class TorchAnalysisRuntime:
             target_inventory,
         )
         self.target_inventory_sha256 = _stable_json_hash(target_inventory)
-        context_payload = {
-            "schema": CONTEXT_SCHEMA,
-            "namespace": context_id or "torch-proxy",
-            "model": {
-                "id": str(model_id),
-                "revision": model_revision,
-                "class": f"{type(model).__module__}.{type(model).__qualname__}",
-            },
-            "tokenizer": _tokenizer_identity(tokenizer),
-            "dataset_sha256": _dataset_hash(self.samples),
-            "sample_count": len(self.samples),
-            "max_length": self.max_length,
-            "batch_size": self.batch_size,
-            "device": self.device,
-            "compute_kl": self.compute_kl,
-            "architecture_adapter_id": self.architecture_adapter.adapter_id,
-            "selected_targets": target_inventory,
-            "target_weight_dtypes": list(self.target_weight_dtypes),
-            "architecture_adapter": self.backend_adapter,
-            "quantizer_id": QUANTIZER_ID,
-            "quantization_semantics": PROXY_SEMANTICS,
-        }
-        self.context_id = (
-            f"{context_payload['namespace']}:"
-            f"{_stable_json_hash(context_payload)}"
-        )
-        self._group_by_id = {
-            group.inventory.group_id: group for group in self._runtime_groups
-        }
+        self._context_namespace = context_id or "torch-proxy"
+        context_payload = self._build_context_payload(target_inventory, resolved_placement)
+        self._context_payload_sha256 = _stable_json_hash(context_payload)
+        self.context_id = f"{self._context_namespace}:{self._context_payload_sha256}"
+        self._group_by_id = {group.inventory.group_id: group for group in self._runtime_groups}
         try:
             forward_parameters = inspect.signature(model.forward).parameters.values()
         except (AttributeError, TypeError, ValueError):
@@ -711,6 +768,7 @@ class TorchAnalysisRuntime:
             model_revision=bundle.revision,
             loader_name=bundle.loader_name,
             loader_warnings=bundle.warnings,
+            placement=bundle.placement,
             **kwargs,
         )
 
@@ -726,9 +784,7 @@ class TorchAnalysisRuntime:
         limit: int | None = None,
         **kwargs: Any,
     ) -> TorchAnalysisRuntime:
-        samples = load_jsonl_texts(
-            path, text_field=text_field, id_field=id_field, limit=limit
-        )
+        samples = load_jsonl_texts(path, text_field=text_field, id_field=id_field, limit=limit)
         return cls(model, tokenizer, samples, **kwargs)
 
     def run(
@@ -774,7 +830,9 @@ class TorchAnalysisRuntime:
                         group.inventory.group_id,
                         precision.value,
                     )
+                    self._assert_context_integrity()
                 measurement = self._evaluate_group(group, precision, baseline)
+                self._assert_context_integrity()
                 measurements.append(measurement)
                 if progress_callback is not None:
                     progress_callback(
@@ -784,6 +842,7 @@ class TorchAnalysisRuntime:
                         group.inventory.group_id,
                         precision.value,
                     )
+                    self._assert_context_integrity()
 
         return AnalysisRunResult(
             groups=self.groups,
@@ -806,16 +865,13 @@ class TorchAnalysisRuntime:
         if not assignments:
             raise ValueError("assignments must not be empty")
         if context_id is not None and context_id != self.context_id:
-            raise ValueError(
-                "context_id override must equal the runtime experiment context"
-            )
+            raise ValueError("context_id override must equal the runtime experiment context")
         self._assert_context_integrity()
         unknown = sorted(set(assignments) - set(self._group_by_id))
         if unknown:
             raise ValueError(f"unknown group IDs: {unknown}")
         normalized = {
-            group_id: _normalize_precision(precision)
-            for group_id, precision in assignments.items()
+            group_id: _normalize_precision(precision) for group_id, precision in assignments.items()
         }
         selected_groups = tuple(self._group_by_id[group_id] for group_id in normalized)
         self._ensure_disjoint_linears(selected_groups)
@@ -823,15 +879,12 @@ class TorchAnalysisRuntime:
         aggregate, kl = self._evaluate_assignment(normalized)
         warnings = list(self._measurement_warnings(normalized.values()))
         warnings.extend(
-            warning
-            for group in selected_groups
-            for warning in group.inventory.warnings
+            warning for group in selected_groups for warning in group.inventory.warnings
         )
         if len(normalized) < len(self._group_by_id):
             warnings.append("groups absent from assignments remain at reference precision")
         assignment_text = ",".join(
-            f"{group_id}={precision.value}"
-            for group_id, precision in sorted(normalized.items())
+            f"{group_id}={precision.value}" for group_id, precision in sorted(normalized.items())
         )
         warnings.append("plan result requires independent whole-model and backend validation")
         warnings.append(f"assignments: {assignment_text}")
@@ -857,6 +910,71 @@ class TorchAnalysisRuntime:
                 "selected quantization target inventory changed after runtime "
                 "construction; create a new runtime/context before measuring"
             )
+        placement = _resolve_runtime_placement(
+            self._torch,
+            self.model,
+            current,
+            declared=self.placement,
+            requested_device=self.device,
+        )
+        if placement.sha256 != self.placement_sha256:
+            raise TorchAnalysisError(
+                "model placement changed after runtime construction; create a new "
+                "runtime/context before measuring"
+            )
+        current_payload_sha256 = _stable_json_hash(
+            self._build_context_payload(current, placement)
+        )
+        expected_context_id = f"{self._context_namespace}:{self._context_payload_sha256}"
+        if (
+            current_payload_sha256 != self._context_payload_sha256
+            or self.context_id != expected_context_id
+        ):
+            raise TorchAnalysisError(
+                "experiment inputs or analysis settings changed after runtime construction; "
+                "create a new runtime/context before measuring"
+            )
+
+    def _build_context_payload(
+        self,
+        target_inventory: Sequence[Mapping[str, Any]],
+        placement: _ResolvedPlacement,
+    ) -> dict[str, Any]:
+        target_dtypes = sorted(
+            {
+                str(target["dtype"])
+                for group_inventory in target_inventory
+                for target in group_inventory["targets"]
+            }
+        )
+        return {
+            "schema": CONTEXT_SCHEMA,
+            "namespace": self._context_namespace,
+            "model": {
+                "id": str(self.model_id),
+                "revision": self.model_revision,
+                "class": f"{type(self.model).__module__}.{type(self.model).__qualname__}",
+            },
+            "tokenizer": _tokenizer_identity(self.tokenizer),
+            "dataset_sha256": _dataset_hash(self.samples),
+            "sample_count": len(self.samples),
+            "max_length": self.max_length,
+            "batch_size": self.batch_size,
+            "device": self.device,
+            "placement": {
+                **placement.placement.to_dict(),
+                "model_devices": list(placement.model_devices),
+                "target_devices": list(placement.target_devices),
+                "sha256": placement.sha256,
+            },
+            "compute_kl": self.compute_kl,
+            "architecture_adapter_id": self.architecture_adapter.adapter_id,
+            "selected_targets": target_inventory,
+            "target_weight_dtypes": target_dtypes,
+            "architecture_adapter": self.backend_adapter,
+            "quantizer_id": QUANTIZER_ID,
+            "quantization_semantics": PROXY_SEMANTICS,
+        }
 
     def _evaluate_group(
         self,
@@ -868,9 +986,7 @@ class TorchAnalysisRuntime:
             aggregate = baseline
             kl = 0.0 if self.compute_kl else None
         else:
-            aggregate, kl = self._evaluate_assignment(
-                {group.inventory.group_id: precision}
-            )
+            aggregate, kl = self._evaluate_assignment({group.inventory.group_id: precision})
         return InterventionMeasurement(
             group_id=group.inventory.group_id,
             precision=precision,
@@ -1002,17 +1118,13 @@ class TorchAnalysisRuntime:
         if logits is None and isinstance(output, (tuple, list)) and output:
             logits = output[0]
         if logits is None or getattr(logits, "ndim", 0) != 3:
-            raise TorchAnalysisError(
-                "causal LM output must expose [batch, sequence, vocab] logits"
-            )
+            raise TorchAnalysisError("causal LM output must expose [batch, sequence, vocab] logits")
         if not bool(self._torch.isfinite(logits).all()):
             raise TorchAnalysisError("model produced non-finite logits")
         return logits
 
     @contextmanager
-    def _interventions(
-        self, assignments: Mapping[str, PrecisionFormat]
-    ) -> Iterator[None]:
+    def _interventions(self, assignments: Mapping[str, PrecisionFormat]) -> Iterator[None]:
         groups = tuple(self._group_by_id[group_id] for group_id in assignments)
         self._ensure_disjoint_linears(groups)
         modules = dict(self.model.named_modules())
@@ -1058,9 +1170,7 @@ class TorchAnalysisRuntime:
                         f"overlap at Linear {name!r}"
                     )
 
-    def _measurement_warnings(
-        self, precisions: Sequence[PrecisionFormat]
-    ) -> tuple[str, ...]:
+    def _measurement_warnings(self, precisions: Sequence[PrecisionFormat]) -> tuple[str, ...]:
         warnings = [PROXY_SEMANTICS, *self.loader_warnings]
         if not self.compute_kl:
             warnings.append("KL disabled; kl_divergence is null")
@@ -1079,6 +1189,11 @@ class TorchAnalysisRuntime:
             loader_name=self.loader_name,
             loader_warnings=self.loader_warnings,
             device=self.device,
+            placement_schema=PLACEMENT_SCHEMA,
+            placement_strategy=self.placement.strategy,
+            model_devices=self.model_devices,
+            target_devices=self.target_devices,
+            placement_sha256=self.placement_sha256,
             dataset_sha256=_dataset_hash(self.samples),
             sample_count=len(self.samples),
             batch_size=self.batch_size,
@@ -1143,9 +1258,7 @@ def temporary_linear_fake_quant(
         with torch.no_grad():
             module.weight.copy_(backup)
 
-    def activation_weight_hook(
-        module: Any, inputs: tuple[Any, ...]
-    ) -> tuple[Any, ...] | None:
+    def activation_weight_hook(module: Any, inputs: tuple[Any, ...]) -> tuple[Any, ...] | None:
         identity = id(module)
         if identity in active_backups:
             raise TorchAnalysisError("re-entrant Linear fake quantization is not supported")
@@ -1169,7 +1282,7 @@ def temporary_linear_fake_quant(
     try:
         for module in unique_linears:
             handles.append(module.register_forward_pre_hook(activation_weight_hook))
-            handles.append(module.register_forward_hook(restore_hook))
+            handles.append(module.register_forward_hook(restore_hook, always_call=True))
         yield
     finally:
         try:
@@ -1224,9 +1337,7 @@ def _temporary_fused_targets_fake_quant(
         identity = id(module)
         target = target_by_id[identity]
         if identity in active_backups:
-            raise TorchAnalysisError(
-                "re-entrant fused expert fake quantization is not supported"
-            )
+            raise TorchAnalysisError("re-entrant fused expert fake quantization is not supported")
         backups: list[tuple[str, Any]] = []
         try:
             with torch.no_grad():
@@ -1254,11 +1365,13 @@ def _temporary_fused_targets_fake_quant(
             hidden_states = kwargs.get(target.activation_kwarg)
             if hidden_states is not None and torch.is_tensor(hidden_states):
                 updated = dict(kwargs)
-                updated[target.activation_kwarg] = _fake_quant_activation(
-                    torch, hidden_states, 8
-                )
+                updated[target.activation_kwarg] = _fake_quant_activation(torch, hidden_states, 8)
                 return inputs, updated
-            return None
+            raise TorchAnalysisError(
+                "fused expert intervention could not observe a tensor activation at the "
+                f"first positional argument or keyword {target.activation_kwarg!r}; "
+                "refusing to label a weight-only intervention as W4A8/W8A8"
+            )
         except BaseException:
             if identity in active_backups:
                 restore(module)
@@ -1277,7 +1390,7 @@ def _temporary_fused_targets_fake_quant(
                     with_kwargs=True,
                 )
             )
-            handles.append(module.register_forward_hook(restore_hook))
+            handles.append(module.register_forward_hook(restore_hook, always_call=True))
         yield
     finally:
         try:
@@ -1328,14 +1441,10 @@ def temporary_group_fake_quant(
         raise ValueError("a group must contain at least one supported quantization target")
     with ExitStack() as stack:
         if linears:
-            stack.enter_context(
-                temporary_linear_fake_quant(linears, precision, torch_module=torch)
-            )
+            stack.enter_context(temporary_linear_fake_quant(linears, precision, torch_module=torch))
         if expert_modules:
             stack.enter_context(
-                temporary_fused_expert_fake_quant(
-                    expert_modules, precision, torch_module=torch
-                )
+                temporary_fused_expert_fake_quant(expert_modules, precision, torch_module=torch)
             )
         yield
 
@@ -1393,13 +1502,13 @@ def _nll_sum_and_count(
     if input_ids.shape[1] < 2:
         return 0.0, 0
     prediction = logits[:, :-1, :].to(dtype=torch.float32)
-    labels = input_ids[:, 1:]
+    labels = input_ids[:, 1:].to(prediction.device)
     # A valid next-token target requires both a real context token and a real
     # target token.  Checking only the target side incorrectly scores the first
     # non-padding token when a tokenizer uses left padding.
-    valid = attention_mask[:, :-1].to(dtype=torch.bool) & attention_mask[:, 1:].to(
-        dtype=torch.bool
-    )
+    valid = attention_mask[:, :-1].to(device=prediction.device, dtype=torch.bool) & attention_mask[
+        :, 1:
+    ].to(device=prediction.device, dtype=torch.bool)
     losses = torch.nn.functional.cross_entropy(
         prediction.reshape(-1, prediction.shape[-1]),
         labels.reshape(-1),
@@ -1412,11 +1521,15 @@ def _kl_sum(torch: Any, reference_logits: Any, candidate_logits: Any, mask: Any)
     if reference_logits.shape != candidate_logits.shape:
         raise TorchAnalysisError("reference and candidate logits shapes must match for KL")
     reference = reference_logits[:, :-1, :].to(dtype=torch.float32)
+    if candidate_logits.device != reference_logits.device:
+        raise TorchAnalysisError("reference and candidate logits must be on the same device for KL")
     candidate = candidate_logits[:, :-1, :].to(dtype=torch.float32)
     log_p = torch.nn.functional.log_softmax(reference, dim=-1)
     log_q = torch.nn.functional.log_softmax(candidate, dim=-1)
     token_kl = torch.sum(torch.exp(log_p) * (log_p - log_q), dim=-1)
-    valid = mask[:, :-1].to(dtype=torch.bool) & mask[:, 1:].to(dtype=torch.bool)
+    valid = mask[:, :-1].to(device=token_kl.device, dtype=torch.bool) & mask[:, 1:].to(
+        device=token_kl.device, dtype=torch.bool
+    )
     return float(token_kl.masked_select(valid).sum().item())
 
 
@@ -1449,19 +1562,13 @@ def _build_runtime_groups(
         expert_coverage = False
         for module_name in module_names:
             if module_name not in modules:
-                raise DiscoveryError(
-                    f"module {module_name!r} for group {group_id!r} was not found"
-                )
+                raise DiscoveryError(f"module {module_name!r} for group {group_id!r} was not found")
             if module_name in seen_module_names:
                 raise DiscoveryError(f"module {module_name!r} belongs to more than one group")
             seen_module_names.add(module_name)
             block = modules[module_name]
             for relative_name, child in block.named_modules():
-                full_name = (
-                    module_name
-                    if not relative_name
-                    else f"{module_name}.{relative_name}"
-                )
+                full_name = module_name if not relative_name else f"{module_name}.{relative_name}"
                 lowered = full_name.lower()
                 class_name = type(child).__name__.lower()
                 is_expert_like = "expert" in lowered or "expert" in class_name
@@ -1568,8 +1675,10 @@ def _build_runtime_groups(
                 )
                 quantized_target_names.append(full_name)
                 backend_patterns.append(mapping.backend_pattern)
+                group_warnings.append(f"fused_expert_parameters={','.join(parameter_names)}")
                 group_warnings.append(
-                    f"fused_expert_parameters={','.join(parameter_names)}"
+                    "fused_activation_proxy=module_input_a8_only; internal projection "
+                    "activations such as down_proj input are not intercepted"
                 )
                 group_warnings.append(
                     f"backend_mapping={full_name}->{mapping.backend_pattern} "
@@ -1591,9 +1700,7 @@ def _build_runtime_groups(
                 if strict_targets:
                     raise DiscoveryError(detail)
             else:
-                detail = (
-                    f"group {group_id!r} appears dense; no routed-expert target was expected"
-                )
+                detail = f"group {group_id!r} appears dense; no routed-expert target was expected"
             group_warnings.append(detail)
         elif expert_like_module_seen and not expert_targets:
             group_warnings.append(
@@ -1674,9 +1781,7 @@ def _normalize_precision(value: PrecisionFormat | str) -> PrecisionFormat:
                 PrecisionFormat.W8A8,
             )
         )
-        raise ValueError(
-            f"unsupported proxy precision {raw!r}; expected one of {allowed}"
-        ) from exc
+        raise ValueError(f"unsupported proxy precision {raw!r}; expected one of {allowed}") from exc
     if normalized not in {
         PrecisionFormat.BF16,
         PrecisionFormat.W4A8,
@@ -1764,6 +1869,8 @@ def _selected_target_inventory(
                     "module_class": f"{type(module).__module__}.{type(module).__qualname__}",
                     "shape": list(weight.shape),
                     "dtype": str(weight.dtype),
+                    "device": str(weight.device),
+                    "contiguous": bool(weight.is_contiguous()),
                 }
             )
         for expert in group.expert_targets:
@@ -1774,11 +1881,11 @@ def _selected_target_inventory(
                     {
                         "kind": "fused_expert_weight",
                         "name": f"{expert.module_name}.{parameter_name}",
-                        "module_class": (
-                            f"{type(module).__module__}.{type(module).__qualname__}"
-                        ),
+                        "module_class": (f"{type(module).__module__}.{type(module).__qualname__}"),
                         "shape": list(parameter.shape),
                         "dtype": str(parameter.dtype),
+                        "device": str(parameter.device),
+                        "contiguous": bool(parameter.is_contiguous()),
                     }
                 )
         inventory.append(
@@ -1819,9 +1926,7 @@ def _require_bf16_target_anchor(
     )
 
 
-def _validate_patterns(
-    name: str, values: Sequence[str], *, allow_empty: bool
-) -> tuple[str, ...]:
+def _validate_patterns(name: str, values: Sequence[str], *, allow_empty: bool) -> tuple[str, ...]:
     if isinstance(values, str):
         patterns = (values,)
     else:
@@ -1841,9 +1946,7 @@ def _effective_exclude_patterns(
     """Merge caller filters with non-removable runtime safety exclusions."""
 
     required = (
-        adapter.nonremovable_exclude_patterns
-        if adapter is not None
-        else DEFAULT_LINEAR_EXCLUDE
+        adapter.nonremovable_exclude_patterns if adapter is not None else DEFAULT_LINEAR_EXCLUDE
     )
     return tuple(dict.fromkeys((*required, *configured)))
 
@@ -1863,10 +1966,7 @@ def _uniform_indexes(total: int, count: int) -> set[int]:
         return set(range(total))
     if count == 1:
         return {total // 2}
-    return {
-        round(position * (total - 1) / (count - 1))
-        for position in range(count)
-    }
+    return {round(position * (total - 1) / (count - 1)) for position in range(count)}
 
 
 def _select_runtime_groups(
@@ -1907,6 +2007,315 @@ def _select_runtime_groups(
 
 def _ordered_unique(values: Iterator[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
+
+
+def _placement_from_loaded_model(
+    model: Any,
+    *,
+    requested_device: str | None,
+    hf_auto: bool,
+) -> ModelPlacement:
+    input_device = str(_model_input_device(_require_torch(), model))
+    raw_map = getattr(model, "hf_device_map", None)
+    device_map = _normalize_device_map(raw_map)
+    if hf_auto:
+        if not device_map:
+            raise TorchAnalysisError(
+                "device='auto' requested Hugging Face module sharding, but the loaded "
+                "model exposes no hf_device_map; use an explicit single device or a "
+                "custom loader returning ModelBundle(..., placement=ModelPlacement(...))"
+            )
+        return ModelPlacement(
+            strategy="hf_device_map",
+            input_device=input_device,
+            device_map=device_map,
+        )
+    return ModelPlacement(
+        strategy="single_device",
+        input_device=str(requested_device or input_device),
+        device_map=device_map,
+    )
+
+
+def _resolve_runtime_placement(
+    torch: Any,
+    model: Any,
+    target_inventory: Sequence[Mapping[str, Any]],
+    *,
+    declared: ModelPlacement | None,
+    requested_device: str | None,
+) -> _ResolvedPlacement:
+    """Validate the resident one-process placement used by interventions."""
+
+    distributed = getattr(torch, "distributed", None)
+    is_initialized = getattr(distributed, "is_initialized", None)
+    get_world_size = getattr(distributed, "get_world_size", None)
+    if (
+        callable(is_initialized)
+        and bool(is_initialized())
+        and callable(get_world_size)
+        and int(get_world_size()) > 1
+    ):
+        raise TorchAnalysisError(
+            "distributed parameter execution (TP/EP/FSDP/ZeRO or multi-process "
+            "pipeline) is outside the P0 placement contract"
+        )
+
+    model_devices = tuple(sorted({str(parameter.device) for parameter in model.parameters()}))
+    if not model_devices:
+        model_devices = (str(_model_input_device(torch, model)),)
+    requested_backend = _requested_auto_backend(requested_device)
+    if requested_backend is not None:
+        actual_backends = {
+            _device_kind(device)
+            for device in model_devices
+            if _device_kind(device) not in {"", "cpu", "disk", "meta"}
+        }
+        if actual_backends != {requested_backend}:
+            raise TorchAnalysisError(
+                f"device={requested_device!r} requires the loaded model to reside on "
+                f"{requested_backend}; found backends {sorted(actual_backends) or ['none']}"
+            )
+    target_devices = tuple(
+        sorted(
+            {
+                str(target["device"])
+                for group in target_inventory
+                for target in group["targets"]
+            }
+        )
+    )
+    input_device = str(_model_input_device(torch, model))
+    raw_map = getattr(model, "hf_device_map", None)
+    inferred_map = _normalize_device_map(raw_map)
+
+    placement = declared
+    if placement is None:
+        if len(model_devices) > 1:
+            raise TorchAnalysisError(
+                "the loaded model spans multiple devices but no placement contract was "
+                "declared; a custom sharded loader must return ModelBundle with "
+                "ModelPlacement(strategy='pre_sharded', input_device=...)"
+            )
+        placement = ModelPlacement(
+            strategy="single_device",
+            input_device=input_device,
+            device_map=inferred_map,
+        )
+    elif placement.strategy == "hf_device_map" and not placement.device_map:
+        if not inferred_map:
+            raise TorchAnalysisError(
+                "hf_device_map placement requires the loaded model to expose a non-empty "
+                "hf_device_map"
+            )
+        placement = replace(placement, device_map=inferred_map)
+    elif placement.strategy == "pre_sharded" and not placement.device_map:
+        raise TorchAnalysisError(
+            "pre_sharded placement requires a non-empty device_map that covers the "
+            "loaded model parameters"
+        )
+
+    declared_input = placement.input_device or input_device
+    if _canonical_device(declared_input) != _canonical_device(input_device):
+        raise TorchAnalysisError(
+            "placement input_device does not match the loaded input embedding device: "
+            f"declared={declared_input!r}, embedding={input_device!r}"
+        )
+    if requested_device is not None and not _is_auto_device(requested_device) and (
+        _canonical_device(str(requested_device)) != _canonical_device(input_device)
+    ):
+        raise TorchAnalysisError(
+            "configured device must be the input embedding device for a resident model: "
+            f"configured={requested_device!r}, embedding={input_device!r}"
+        )
+
+    forbidden_model_devices = tuple(
+        device for device in model_devices if _device_kind(device) in {"meta"}
+    )
+    forbidden_map_devices = tuple(
+        device for _name, device in placement.device_map if _device_kind(device) in {"disk", "meta"}
+    )
+    if forbidden_model_devices or forbidden_map_devices:
+        raise TorchAnalysisError(
+            "QuantPlan interventions require resident weights; meta/disk offload is "
+            "unsupported. offending devices="
+            f"{list(dict.fromkeys((*forbidden_model_devices, *forbidden_map_devices)))}"
+        )
+
+    if placement.device_map:
+        _validate_resident_device_map(model, placement.device_map, model_devices)
+
+    if placement.strategy == "single_device" and len(model_devices) != 1:
+        raise TorchAnalysisError(
+            "single_device placement found model parameters on multiple devices: "
+            f"{list(model_devices)}"
+        )
+    if placement.strategy in {"hf_device_map", "pre_sharded"}:
+        cpu_or_disk = tuple(
+            device
+            for device in (*model_devices, *(value for _, value in placement.device_map))
+            if _device_kind(device) in {"cpu", "disk", "meta"}
+        )
+        if cpu_or_disk:
+            raise TorchAnalysisError(
+                "P0 sharded analysis supports accelerator-resident modules only; "
+                "CPU/disk/meta offload is not supported. offending devices="
+                f"{list(dict.fromkeys(cpu_or_disk))}"
+            )
+        accelerator_kinds = {
+            _device_kind(device) for device in model_devices if _device_kind(device)
+        }
+        if len(accelerator_kinds) != 1:
+            raise TorchAnalysisError(
+                "sharded placement must use one accelerator backend; found "
+                f"{sorted(accelerator_kinds)}"
+            )
+
+    if not target_devices:
+        raise TorchAnalysisError("selected target inventory contains no weight devices")
+    noncontiguous = tuple(
+        str(target["name"])
+        for group in target_inventory
+        for target in group["targets"]
+        if not bool(target["contiguous"])
+    )
+    if noncontiguous:
+        raise TorchAnalysisError(
+            "selected quantization target weights must be contiguous for in-place "
+            f"fake quantization; found {list(noncontiguous[:8])}"
+        )
+    if any(_device_kind(device) in {"cpu", "disk", "meta"} for device in target_devices) and (
+        placement.strategy != "single_device" or target_devices != ("cpu",)
+    ):
+        raise TorchAnalysisError(
+            "selected quantization targets must be accelerator-resident for sharded "
+            f"analysis; found {list(target_devices)}"
+        )
+
+    evidence = {
+        "schema": PLACEMENT_SCHEMA,
+        "strategy": placement.strategy,
+        "input_device": input_device,
+        "model_devices": list(model_devices),
+        "target_devices": list(target_devices),
+        "device_map": dict(placement.device_map),
+    }
+    return _ResolvedPlacement(
+        placement=replace(placement, input_device=input_device),
+        input_device=input_device,
+        model_devices=model_devices,
+        target_devices=target_devices,
+        sha256=_stable_json_hash(evidence),
+    )
+
+
+def _normalize_device_map(value: Any) -> tuple[tuple[str, str], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, Mapping):
+        raise TorchAnalysisError("model.hf_device_map must be a mapping when present")
+    return tuple(sorted((str(name), str(device)) for name, device in value.items()))
+
+
+def _validate_resident_device_map(
+    model: Any,
+    device_map: Sequence[tuple[str, str]],
+    model_devices: Sequence[str],
+) -> None:
+    """Verify a module device map against the parameters that were actually loaded."""
+
+    module_names = {name for name, _module in model.named_modules()}
+    unknown_modules = tuple(name for name, _device in device_map if name not in module_names)
+    if unknown_modules:
+        raise TorchAnalysisError(
+            "placement device_map contains module paths absent from named_modules: "
+            f"{list(unknown_modules[:8])}"
+        )
+
+    accelerator_kinds = {
+        _device_kind(device)
+        for device in model_devices
+        if _device_kind(device) not in {"", "cpu", "disk", "meta"}
+    }
+    numeric_backend = next(iter(accelerator_kinds)) if len(accelerator_kinds) == 1 else None
+    uncovered: list[str] = []
+    mismatches: list[str] = []
+    ordered_map = sorted(device_map, key=lambda item: len(item[0]), reverse=True)
+    for parameter_name, parameter in model.named_parameters():
+        match = next(
+            (
+                (module_name, declared_device)
+                for module_name, declared_device in ordered_map
+                if not module_name
+                or parameter_name == module_name
+                or parameter_name.startswith(f"{module_name}.")
+            ),
+            None,
+        )
+        if match is None:
+            uncovered.append(parameter_name)
+            continue
+        module_name, declared_device = match
+        declared_canonical = _canonical_device_map_value(declared_device, numeric_backend)
+        actual_canonical = _canonical_device(str(parameter.device))
+        if declared_canonical != actual_canonical:
+            mismatches.append(
+                f"{parameter_name}: map[{module_name!r}]={declared_device!r}, "
+                f"actual={str(parameter.device)!r}"
+            )
+    if uncovered:
+        raise TorchAnalysisError(
+            "placement device_map does not cover every loaded parameter; missing "
+            f"{list(uncovered[:8])}"
+        )
+    if mismatches:
+        raise TorchAnalysisError(
+            "placement device_map disagrees with loaded parameter devices: "
+            f"{mismatches[:8]}"
+        )
+
+
+def _canonical_device_map_value(value: str, numeric_backend: str | None) -> str:
+    normalized = value.strip().lower()
+    if normalized.isdecimal():
+        if numeric_backend is None:
+            raise TorchAnalysisError(
+                "numeric device_map entries require exactly one observable accelerator backend"
+            )
+        return f"{numeric_backend}:{int(normalized)}"
+    return _canonical_device(normalized)
+
+
+def _canonical_device(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized in {"cuda", "npu", "xpu"}:
+        return f"{normalized}:0"
+    return normalized
+
+
+def _is_auto_device(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"auto", "npu:auto", "cuda:auto", "xpu:auto"}
+
+
+def _requested_auto_backend(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    backend, separator, policy = normalized.partition(":")
+    if separator == ":" and policy == "auto" and backend in {"npu", "cuda", "xpu"}:
+        return backend
+    return None
+
+
+def _device_kind(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized.isdecimal():
+        # HF device maps may use integer accelerator ordinals. Actual parameter
+        # devices remain authoritative for the backend kind.
+        return ""
+    return normalized.partition(":")[0]
 
 
 def _model_input_device(torch: Any, model: Any) -> Any:
@@ -1953,6 +2362,16 @@ def _require_transformers() -> Any:
         raise TransformersDependencyError(
             "Transformers is required by the default Hugging Face loader; install "
             "transformers or provide loader_entrypoint='module:function'"
+        ) from exc
+
+
+def _require_torch_npu() -> Any:
+    try:
+        return importlib.import_module("torch_npu")
+    except (ImportError, OSError) as exc:
+        raise TorchDependencyError(
+            "an NPU device was requested but torch_npu could not be imported; install "
+            "the torch_npu build matched to PyTorch and CANN"
         ) from exc
 
 
@@ -2008,15 +2427,30 @@ def _coerce_model_bundle(
 ) -> ModelBundle:
     if isinstance(value, ModelBundle):
         return value
+    placement: ModelPlacement | None = None
     if isinstance(value, Mapping):
         model = value.get("model")
         tokenizer = value.get("tokenizer")
+        raw_placement = value.get("placement")
+        if isinstance(raw_placement, ModelPlacement):
+            placement = raw_placement
+        elif isinstance(raw_placement, Mapping):
+            raw_map = raw_placement.get("device_map", {})
+            placement = ModelPlacement(
+                strategy=str(raw_placement.get("strategy", "")),
+                input_device=(
+                    str(raw_placement["input_device"])
+                    if raw_placement.get("input_device") is not None
+                    else None
+                ),
+                device_map=_normalize_device_map(raw_map),
+            )
+        elif raw_placement is not None:
+            raise TypeError("custom loader placement must be ModelPlacement, a mapping, or null")
     elif isinstance(value, (tuple, list)) and len(value) == 2:
         model, tokenizer = value
     else:
-        raise TypeError(
-            "custom loader must return ModelBundle, (model, tokenizer), or a mapping"
-        )
+        raise TypeError("custom loader must return ModelBundle, (model, tokenizer), or a mapping")
     if model is None or tokenizer is None:
         raise TypeError("custom loader result must contain non-null model and tokenizer")
     return ModelBundle(
@@ -2025,4 +2459,5 @@ def _coerce_model_bundle(
         model_id=model_id,
         revision=revision,
         loader_name=loader_name,
+        placement=placement,
     )

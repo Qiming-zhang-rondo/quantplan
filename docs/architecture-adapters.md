@@ -87,6 +87,12 @@ ModelSlim Qwen3.5 MoE adapter 提交，并声明：
 这只说明该版本映射有源码依据，不说明任意 Qwen3.5 revision、W4A8/W8A8 混配、NPU
 权重生成或部署性能已经验证。相关结论仍以独立实验和 capability manifest 为准。
 
+当前 resident runtime 能完整干预 fused expert 的打包权重，但 A8 hook 只位于 expert
+模块入口，不能看到内部 `down_proj` 的中间激活；inventory 会显式记录
+`fused_activation_proxy=module_input_a8_only`。这是一项待内网相关性实验验证的代理边界，
+不是 ModelSlim-exact W4A8/W8A8 支持声明。流式 runner 必须在内部每次矩阵乘处调用候选
+干预接口，才能把该边界升级为完整覆盖。
+
 ### 其他家族
 
 GLM、DeepSeek、Kimi 必须按“家族 + 代际/变体 + 后端版本”分别实现和审计插件。不能用

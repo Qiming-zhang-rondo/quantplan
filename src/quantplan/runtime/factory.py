@@ -97,7 +97,11 @@ def build_torch_runtime(config: RunConfig) -> TorchAnalysisRuntime:
         strict_targets=config.runtime.strict_target_coverage,
         batch_size=config.analysis.batch_size,
         max_length=config.analysis.max_length,
-        device=config.device,
+        # An explicit ModelPlacement returned by the loader is authoritative for
+        # the input ordinal. A typed auto request (for example npu:auto) remains
+        # a backend constraint so a loader cannot silently return CUDA instead.
+        # Legacy loaders without placement retain the full configured constraint.
+        device=_runtime_device_constraint(config.device, bundle.placement is not None),
         compute_kl=config.analysis.compute_kl,
     )
     discovered_targets = {
@@ -162,6 +166,15 @@ def uniformly_select(values: tuple[str, ...], limit: int) -> tuple[str, ...]:
         round(step * (len(values) - 1) / (limit - 1)) for step in range(limit)
     }
     return tuple(value for index, value in enumerate(values) if index in indexes)
+
+
+def _runtime_device_constraint(configured_device: str, has_placement: bool) -> str | None:
+    if not has_placement:
+        return configured_device
+    normalized = configured_device.strip().lower()
+    if normalized in {"npu:auto", "cuda:auto", "xpu:auto"}:
+        return configured_device
+    return None
 
 
 __all__ = ["build_torch_runtime", "expand_block_patterns", "uniformly_select"]

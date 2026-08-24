@@ -816,7 +816,7 @@ model_path: REPLACE_WITH_MODEL_PATH
 data_path: REPLACE_WITH_DATA_PATH
 original_yaml: REPLACE_WITH_ORIGINAL_MODELSLIM_YAML
 output_dir: REPLACE_WITH_OUTPUT_DIRECTORY
-device: REPLACE_WITH_DEVICE  # Example: npu:0
+device: REPLACE_WITH_DEVICE  # npu:0=single card; npu:auto=resident module sharding
 
 # Optional conservative defaults. A custom loader must use module:function syntax.
 runtime:

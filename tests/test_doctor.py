@@ -99,6 +99,7 @@ runtime:
     ("available", "count", "device", "expected_status", "message"),
     [
         (True, 2, "npu:1", "pass", "npu:1 is available"),
+        (True, 2, "npu:auto", "pass", "across 2 visible device(s)"),
         (True, 1, "npu:1", "blocking", "device_count() returned 1"),
         (False, 2, "npu:0", "blocking", "is_available() returned false"),
     ],
@@ -208,6 +209,47 @@ def test_doctor_rejects_invalid_npu_device_syntax(tmp_path: Path) -> None:
     check = next(item for item in report.checks if item.code == "device.npu")
     assert check.status == "blocking"
     assert "npu:<non-negative-index>" in check.message
+
+
+def test_doctor_requires_accelerate_for_hf_auto_sharding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _valid_config(tmp_path, device="auto")
+    monkeypatch.setattr(
+        doctor_module,
+        "_safe_find_spec",
+        lambda name: (None, "not installed") if name == "accelerate" else (object(), None),
+    )
+
+    report = inspect_environment(config)
+
+    dependency = next(item for item in report.checks if item.code == "dependency.accelerate")
+    placement = next(item for item in report.checks if item.code == "placement.mode")
+    assert dependency.status == "blocking"
+    assert placement.status == "warning"
+    assert report.ready_for_analysis is False
+
+
+def test_doctor_rejects_old_accelerate_for_hf_auto_sharding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _valid_config(tmp_path, device="auto")
+    monkeypatch.setattr(doctor_module, "_safe_find_spec", lambda _name: (object(), None))
+    monkeypatch.setattr(
+        doctor_module,
+        "_package_version",
+        lambda *names: "0.27.2" if "accelerate" in names else "1.0.0",
+    )
+
+    report = inspect_environment(config)
+
+    dependency = next(item for item in report.checks if item.code == "dependency.accelerate")
+    assert dependency.status == "blocking"
+    assert "require >=0.28" in dependency.message
+    assert report.environment["packages"]["accelerate"] == "0.27.2"
+    assert report.ready_for_analysis is False
 
 
 def _valid_config(

@@ -10,6 +10,8 @@ from quantplan.domain.models import PrecisionFormat
 from quantplan.runtime import (
     PROXY_SEMANTICS,
     QWEN35_MOE_ADAPTER_ID,
+    ModelBundle,
+    ModelPlacement,
     TorchAnalysisError,
     TorchAnalysisRuntime,
     TorchDependencyError,
@@ -23,8 +25,7 @@ from quantplan.runtime import (
 def test_jsonl_text_loader_keeps_ids_and_metadata(tmp_path) -> None:
     source = tmp_path / "samples.jsonl"
     source.write_text(
-        '\n{"id":"a","text":"hello","domain":"en"}\n'
-        '{"text":"world","score":2}\n',
+        '\n{"id":"a","text":"hello","domain":"en"}\n{"text":"world","score":2}\n',
         encoding="utf-8",
     )
 
@@ -97,6 +98,59 @@ def test_custom_loader_entrypoint_does_not_require_transformers(monkeypatch) -> 
 
 def test_auto_torch_dtype_is_preserved_for_loader_semantics() -> None:
     assert torch_analysis._resolve_torch_dtype(SimpleNamespace(), "auto") == "auto"
+
+
+def test_hf_auto_loader_records_device_map_placement(monkeypatch) -> None:
+    torch = _torch_or_skip()
+    model, tokenizer = _toy_objects(torch)
+    model.hf_device_map = {"": "cpu"}
+    seen = {}
+
+    class AutoTokenizer:
+        @staticmethod
+        def from_pretrained(_path, **kwargs):
+            seen["tokenizer_kwargs"] = kwargs
+            return tokenizer
+
+    class AutoModel:
+        @staticmethod
+        def from_pretrained(_path, **kwargs):
+            seen["model_kwargs"] = kwargs
+            return model
+
+    monkeypatch.setattr(
+        torch_analysis,
+        "_require_transformers",
+        lambda: SimpleNamespace(
+            AutoTokenizer=AutoTokenizer,
+            AutoModelForCausalLM=AutoModel,
+        ),
+    )
+
+    bundle = load_causal_lm("toy/model", device="auto")
+
+    assert seen["model_kwargs"]["device_map"] == "auto"
+    assert bundle.placement == ModelPlacement(
+        strategy="hf_device_map",
+        input_device="cpu",
+        device_map=(("", "cpu"),),
+    )
+
+
+def test_explicit_device_rejects_separate_hf_device_map(monkeypatch) -> None:
+    _torch_or_skip()
+    monkeypatch.setattr(
+        torch_analysis,
+        "_require_transformers",
+        lambda: SimpleNamespace(),
+    )
+
+    with pytest.raises(TorchAnalysisError, match="cannot be combined"):
+        load_causal_lm(
+            "toy/model",
+            device="cpu",
+            model_kwargs={"device_map": "auto"},
+        )
 
 
 def test_qwen_target_filters_keep_gate_proj_and_lock_router_gate() -> None:
@@ -260,7 +314,12 @@ def test_toy_runtime_discovers_fused_experts_excludes_router_and_restores() -> N
 
     assert len(result.groups) == 2
     assert result.provenance.context_id == runtime.context_id
-    assert result.provenance.context_schema == "quantplan.torch-analysis-context/v1"
+    assert result.provenance.context_schema == "quantplan.torch-analysis-context/v2"
+    assert result.provenance.placement_schema == "quantplan.model-placement/v1"
+    assert result.provenance.placement_strategy == "single_device"
+    assert result.provenance.model_devices == ("cpu",)
+    assert result.provenance.target_devices == ("cpu",)
+    assert len(result.provenance.placement_sha256) == 64
     assert result.provenance.target_weight_dtypes == ("torch.bfloat16",)
     assert len(result.provenance.target_inventory_sha256) == 64
     assert runtime.backend_compilation_ready is True
@@ -274,6 +333,7 @@ def test_toy_runtime_discovers_fused_experts_excludes_router_and_restores() -> N
         assert any(name.endswith(".mlp.gate_proj") for name in group.module_names)
         assert not any(name.endswith(".mlp.gate") for name in group.module_names)
         assert not any(name.endswith(".gate_up_proj") for name in group.module_names)
+        assert any("module_input_a8_only" in warning for warning in group.warnings)
     for measurement in result.measurements:
         assert measurement.token_count > 0
         assert measurement.parameter_count > 0
@@ -331,6 +391,10 @@ def test_runtime_context_fingerprint_binds_experiment_inputs(monkeypatch) -> Non
     )
     assert changed_data.context_id != reference.context_id
 
+    reference.max_length = 6
+    with pytest.raises(TorchAnalysisError, match="analysis settings changed"):
+        reference.run((PrecisionFormat.BF16,))
+
     monkeypatch.setattr(
         torch_analysis,
         "PROXY_SEMANTICS",
@@ -369,6 +433,19 @@ def test_plan_evaluation_cannot_override_runtime_context() -> None:
         )
 
 
+def test_progress_callback_cannot_mutate_experiment_context() -> None:
+    torch = _torch_or_skip()
+    model, tokenizer = _toy_objects(torch)
+    runtime = TorchAnalysisRuntime(model, tokenizer, ["abcdef"], max_length=6, max_groups=1)
+
+    def mutate_runtime(stage, *_event) -> None:
+        if stage == "measurement_start":
+            runtime.max_length = 3
+
+    with pytest.raises(TorchAnalysisError, match="analysis settings changed"):
+        runtime.run((PrecisionFormat.BF16,), progress_callback=mutate_runtime)
+
+
 def test_kl_is_streamed_and_plan_failure_restores_every_target() -> None:
     torch = _torch_or_skip()
     model, tokenizer = _toy_objects(torch)
@@ -404,6 +481,33 @@ def test_kl_is_streamed_and_plan_failure_restores_every_target() -> None:
     assert all(not module._forward_pre_hooks for module in model.modules())
 
 
+def test_fused_intervention_rejects_missing_activation_and_restores_weights() -> None:
+    torch = _torch_or_skip()
+
+    class MissingActivationExpert(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.gate_up_proj = torch.nn.Parameter(
+                torch.randn(2, 4, 4, dtype=torch.bfloat16)
+            )
+            self.down_proj = torch.nn.Parameter(
+                torch.randn(2, 4, 4, dtype=torch.bfloat16)
+            )
+
+        def forward(self, *, token_ids):
+            return token_ids
+
+    expert = MissingActivationExpert()
+    before = _state_snapshot(expert)
+
+    with torch_analysis.temporary_fused_expert_fake_quant(
+        (expert,), PrecisionFormat.W4A8, torch_module=torch
+    ), pytest.raises(TorchAnalysisError, match="weight-only intervention"):
+        expert(token_ids=1)
+
+    _assert_state_equal(torch, expert, before)
+
+
 def test_uniform_max_groups_selection_records_original_coverage() -> None:
     torch = _torch_or_skip()
     model, tokenizer = _toy_objects(torch)
@@ -415,3 +519,171 @@ def test_uniform_max_groups_selection_records_original_coverage() -> None:
     assert runtime.full_group_coverage is False
     assert runtime.groups[0].group_id.endswith(".1")
     assert any("1 of 2" in warning for warning in runtime.groups[0].warnings)
+
+
+def test_custom_loader_can_declare_pre_sharded_placement(monkeypatch) -> None:
+    fake_torch = SimpleNamespace(
+        bfloat16="bf16",
+        float16="fp16",
+        float32="fp32",
+    )
+    monkeypatch.setattr(torch_analysis, "_require_torch", lambda: fake_torch)
+
+    class DummyModel:
+        def eval(self):
+            return self
+
+    model = DummyModel()
+    tokenizer = object()
+
+    bundle = load_causal_lm(
+        "custom/model",
+        device="auto",
+        loader_entrypoint=lambda **_kwargs: {
+            "model": model,
+            "tokenizer": tokenizer,
+            "placement": {
+                "strategy": "pre_sharded",
+                "input_device": "npu:0",
+                "device_map": {"model.layers.0": "npu:0", "model.layers.1": "npu:1"},
+            },
+        },
+    )
+
+    assert isinstance(bundle, ModelBundle)
+    assert bundle.placement == ModelPlacement(
+        strategy="pre_sharded",
+        input_device="npu:0",
+        device_map=(
+            ("model.layers.0", "npu:0"),
+            ("model.layers.1", "npu:1"),
+        ),
+    )
+
+
+def test_pre_sharded_contract_rejects_cpu_offload() -> None:
+    torch = _torch_or_skip()
+    model, tokenizer = _toy_objects(torch)
+
+    with pytest.raises(TorchAnalysisError, match="CPU/disk/meta offload"):
+        TorchAnalysisRuntime(
+            model,
+            tokenizer,
+            ["abc"],
+            max_groups=2,
+            placement=ModelPlacement(
+                strategy="pre_sharded",
+                input_device="cpu",
+                device_map=(("", "cpu"),),
+            ),
+        )
+
+
+def test_meta_targets_are_blocked_before_analysis() -> None:
+    torch = _torch_or_skip()
+    model, tokenizer = _toy_objects(torch)
+    model.to("meta")
+
+    with pytest.raises(TorchAnalysisError, match="meta/disk offload"):
+        TorchAnalysisRuntime(model, tokenizer, ["abc"], max_groups=2)
+
+
+def test_model_placement_normalizes_device_map_order() -> None:
+    placement = ModelPlacement(
+        strategy="pre_sharded",
+        input_device="npu:0",
+        device_map={"model.layers.1": "npu:1", "model.layers.0": "npu:0"},
+    )
+
+    assert placement.device_map == (
+        ("model.layers.0", "npu:0"),
+        ("model.layers.1", "npu:1"),
+    )
+    assert torch_analysis._requested_auto_backend("npu:auto") == "npu"
+    assert torch_analysis._requested_auto_backend("auto") is None
+
+
+def test_resident_device_map_rejects_incorrect_parameter_device() -> None:
+    class Parameter:
+        device = "npu:1"
+
+    class Model:
+        @staticmethod
+        def named_modules():
+            return (("", object()), ("model.layers.0", object()))
+
+        @staticmethod
+        def named_parameters():
+            return (("model.layers.0.weight", Parameter()),)
+
+    with pytest.raises(TorchAnalysisError, match="disagrees"):
+        torch_analysis._validate_resident_device_map(
+            Model(),
+            (("model.layers.0", "npu:0"),),
+            ("npu:1",),
+        )
+
+
+def test_typed_auto_device_rejects_a_different_loaded_backend() -> None:
+    class Parameter:
+        def __init__(self, device: str) -> None:
+            self.device = device
+
+    class Model:
+        parameters_by_name = (
+            ("model.embed_tokens.weight", Parameter("cuda:0")),
+            ("model.layers.0.weight", Parameter("cuda:1")),
+        )
+
+        @classmethod
+        def parameters(cls):
+            return (parameter for _name, parameter in cls.parameters_by_name)
+
+        @classmethod
+        def named_parameters(cls):
+            return iter(cls.parameters_by_name)
+
+        @staticmethod
+        def named_modules():
+            return (
+                ("", object()),
+                ("model", object()),
+                ("model.embed_tokens", object()),
+                ("model.layers", object()),
+                ("model.layers.0", object()),
+            )
+
+        @staticmethod
+        def get_input_embeddings():
+            return SimpleNamespace(weight=Parameter("cuda:0"))
+
+    fake_torch = SimpleNamespace(
+        distributed=SimpleNamespace(is_initialized=lambda: False),
+    )
+    target_inventory = (
+        {
+            "targets": (
+                {
+                    "name": "model.layers.0.weight",
+                    "device": "cuda:1",
+                    "contiguous": True,
+                },
+            )
+        },
+    )
+
+    with pytest.raises(TorchAnalysisError, match="requires.*npu"):
+        torch_analysis._resolve_runtime_placement(
+            fake_torch,
+            Model(),
+            target_inventory,
+            declared=ModelPlacement(
+                strategy="pre_sharded",
+                input_device="cuda:0",
+                device_map={
+                    "model.embed_tokens": "cuda:0",
+                    "model.layers.0": "cuda:1",
+                },
+            ),
+            requested_device="npu:auto",
+        )

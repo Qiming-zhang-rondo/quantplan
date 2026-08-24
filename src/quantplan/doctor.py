@@ -142,6 +142,76 @@ def inspect_environment(config: RunConfig) -> DoctorReport:
             )
         )
 
+    auto_placement = _is_auto_device(config.device)
+    if auto_placement:
+        if config.runtime.loader == "huggingface":
+            accelerate_spec, accelerate_error = _safe_find_spec("accelerate")
+            accelerate_version = _package_version("accelerate")
+            accelerate_version_ok = (
+                accelerate_version is not None
+                and _release_version_at_least(accelerate_version, (0, 28, 0))
+            )
+            if accelerate_spec is None:
+                accelerate_status = "blocking"
+                accelerate_message = _unavailable_message(
+                    "device=auto requires Accelerate>=0.28 for resident module sharding",
+                    accelerate_error,
+                )
+            elif accelerate_version is None:
+                accelerate_status = "warning"
+                accelerate_message = (
+                    "Accelerate is importable, but its distribution version could not be "
+                    "resolved; require >=0.28 in the target environment"
+                )
+            elif not accelerate_version_ok:
+                accelerate_status = "blocking"
+                accelerate_message = (
+                    f"Accelerate {accelerate_version} is too old for this placement "
+                    "contract; require >=0.28"
+                )
+            else:
+                accelerate_status = "pass"
+                accelerate_message = (
+                    f"Accelerate {accelerate_version} is importable for Hugging Face "
+                    "device_map='auto'"
+                )
+            checks.append(
+                DoctorCheck(
+                    code="dependency.accelerate",
+                    status=accelerate_status,
+                    message=accelerate_message,
+                )
+            )
+        checks.append(
+            DoctorCheck(
+                code="placement.mode",
+                status="warning",
+                message=(
+                    f"device={config.device} requests post-load validated resident module "
+                    "sharding; checkpoint capacity and fake-quant workspace are not "
+                    "assessed until the target environment loads the model"
+                    if config.runtime.loader == "huggingface"
+                    else (
+                        f"device={config.device} delegates placement to the custom loader; "
+                        "a multi-device loader must return ModelBundle with an explicit "
+                        "pre_sharded contract, and memory readiness is not assessed"
+                    )
+                ),
+            )
+        )
+    else:
+        checks.append(
+            DoctorCheck(
+                code="placement.mode",
+                status="warning",
+                message=(
+                    f"{config.device} is single-device placement: the complete model plus "
+                    "fake-quant workspace must fit that device; use device=auto or a "
+                    "validated custom sharded loader for larger checkpoints"
+                ),
+            )
+        )
+
     if config.device.lower().startswith("npu"):
         checks.extend(
             _inspect_npu_device(
@@ -226,6 +296,7 @@ def inspect_environment(config: RunConfig) -> DoctorReport:
             "torch": _package_version("torch"),
             "torch_npu": _package_version("torch-npu", "torch_npu"),
             "transformers": _package_version("transformers"),
+            "accelerate": _package_version("accelerate"),
             "msmodelslim": _package_version("msmodelslim"),
         },
         "execution_readiness": "not_assessed",
@@ -244,6 +315,26 @@ def _package_version(*distribution_names: str) -> str | None:
         except metadata.PackageNotFoundError:
             continue
     return None
+
+
+def _release_version_at_least(value: str, minimum: tuple[int, ...]) -> bool:
+    release: list[int] = []
+    for part in value.split("."):
+        digits = ""
+        for character in part:
+            if not character.isdecimal():
+                break
+            digits += character
+        if not digits:
+            break
+        release.append(int(digits))
+        if len(release) == len(minimum):
+            break
+    if not release:
+        return False
+    release.extend(0 for _ in range(len(minimum) - len(release)))
+    normalized = tuple(release)
+    return normalized >= minimum
 
 
 def _safe_find_spec(module_name: str) -> tuple[Any | None, str | None]:
@@ -391,6 +482,12 @@ def _inspect_npu_device(
     if not backend_available:
         message = "torch.npu.is_available() returned false"
         status = "blocking"
+    elif requested_index is None and count < 1:
+        message = "NPU auto placement requested, but no NPU devices were found"
+        status = "blocking"
+    elif requested_index is None:
+        message = f"NPU auto placement is available across {count} visible device(s)"
+        status = "pass"
     elif count <= requested_index:
         message = (
             f"requested npu:{requested_index}, but torch.npu.device_count() returned {count}"
@@ -406,14 +503,20 @@ def _inspect_npu_device(
     return tuple(checks)
 
 
-def _parse_npu_device(device: str) -> tuple[int, str | None]:
+def _parse_npu_device(device: str) -> tuple[int | None, str | None]:
     normalized = device.strip().lower()
+    if normalized == "npu:auto":
+        return None, None
     if normalized == "npu":
         return 0, None
     prefix, separator, raw_index = normalized.partition(":")
     if prefix != "npu" or separator != ":" or not raw_index.isdecimal():
         return 0, "NPU device must use 'npu' or 'npu:<non-negative-index>' syntax"
     return int(raw_index), None
+
+
+def _is_auto_device(device: str) -> bool:
+    return device.strip().lower() in {"auto", "npu:auto", "cuda:auto", "xpu:auto"}
 
 
 __all__ = ["DoctorCheck", "DoctorReport", "inspect_environment"]

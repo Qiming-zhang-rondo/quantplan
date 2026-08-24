@@ -12,7 +12,7 @@ QuantPlan 是面向模型量化工程师的**证据驱动混合精度规划 P0 �
 | --- | --- |
 | `quantplan init / doctor / run` 一键工作流 | 已实现 |
 | 整模型 teacher-forced 单组 W4A8/W8A8 fake-quant 前向 | 已实现；分析代理，不是 ModelSlim-exact |
-| 普通 `nn.Linear` 和 Qwen 风格三维 fused MoE experts | 已实现；router 默认排除 |
+| 普通 `nn.Linear` 和 Qwen 风格三维 fused MoE experts | 已实现；fused 权重完整，A8 仅覆盖模块入口，router 默认排除 |
 | 成本约束搜索与完整组合方案 ΔNLL 复测 | 已实现 |
 | ModelSlim YAML 严格预检、派生 YAML、diff 和 provenance | 已实现 |
 | 对角梯度加权 Risk 与排序评测研究接口 | 已实现；不是默认决策指标 |
@@ -33,13 +33,15 @@ observed_damage(g, q) = max(0, candidate_NLL(g, q) - BF16_NLL)
 
 这是候选相关的整模型观测值，因此该 Block 的残差连接、RMSNorm 以及所有后续层传播都会影响结果。它仍然只是当前数据和 fake-quant 语义下的边际证据，不能直接代表任务准确率或真实 NPU kernel。
 
+Qwen fused expert 的 P0 代理会对打包的 `gate_up_proj`/`down_proj` 权重全部做 W4/W8 QDQ，但普通 module hook 只能量化 expert 模块入口激活，暂时捕获不到内部 `down_proj` 的中间激活 A8。该限制会写入每个相关决策组的 warning；因此首轮结果用于排序与相关性验证，不应冒充 ModelSlim-exact W4A8/W8A8 结论。后续复用 `accuracy_bench` 流式 expert 路径时，会在每次内部矩阵乘之前补齐干预点。
+
 规划器使用同一组 W4A8/W8A8/BF16 的实测差做 gain-per-cost 搜索，再将完整混合方案重新前向。组合方案超过 `search.max_delta_nll` 时，不生成派生 YAML。KL 可以通过 `analysis.compute_kl: true` 开启；默认关闭，以减少 35B 分析中的全词表计算。
 
 仓库仍保留对角梯度加权 Risk，供研究和对照实验使用，但它不是一键工作流的默认判定依据。
 
 ## 内网快速开始
 
-请在已经安装目标版本 `torch`、`torch_npu` 和 `transformers` 的内网环境中安装 QuantPlan。项目故意不自动安装这些包，避免破坏 ModelSlim 的严格版本组合。
+请在已经安装目标版本 `torch`、`torch_npu` 和 `transformers` 的内网环境中安装 QuantPlan；使用 `npu:auto` 时还需要与该组合兼容的 `accelerate>=0.28`。项目故意不自动安装这些包，避免破坏 ModelSlim 的严格版本组合。
 
 ```bash
 git clone https://github.com/Qiming-zhang-rondo/quantplan.git
@@ -73,8 +75,10 @@ quantplan init quantplan-run.yaml \
   --data-path /data/calibration.jsonl \
   --original-yaml /configs/modelslim.yaml \
   --output-dir /results/quantplan-pilot \
-  --device npu:0
+  --device npu:auto
 ```
+
+对 35B 模型，`npu:0` 表示整模单卡加载，只有模型与 fake-quant 临时空间都能放入该卡时才应使用。`npu:auto` 会请求 Hugging Face/Accelerate 的 `device_map="auto"` 并先确认 NPU runtime 可用；加载后 QuantPlan 还会核对实际参数与候选 target 的 placement。CPU/disk/meta offload和已检测到的多进程 distributed 执行会阻断。合同同时禁止 TP/FSDP/EP 和单进程参数切片，但任意自定义实现无法只靠通用反射完全识别，custom loader 必须如实声明。
 
 不提供参数时，`quantplan init` 会生成带 `REPLACE_WITH_*` 占位符的模板；`doctor` 和 `run` 都会阻断未填写的模板。完整配置示例见 `examples/quantplan-run.yaml`。
 
@@ -84,7 +88,7 @@ quantplan init quantplan-run.yaml \
 quantplan doctor --config quantplan-run.yaml
 ```
 
-`doctor` 不加载模型权重，只检查路径、依赖、设备、候选范围和 YAML 基础结构。NPU 配置会实际导入 `torch_npu`，并调用 `torch.npu.is_available()` 和 `device_count()` 核对请求的卡号；无法完成探测也会给出明确的阻断原因。返回码 `0` 表示可以开始分析，`2` 表示存在阻断项。
+`doctor` 不加载模型权重，只检查路径、依赖、设备、候选范围和 YAML 基础结构。具体 NPU 配置会实际导入 `torch_npu`，并调用 `torch.npu.is_available()` 和 `device_count()` 核对请求的卡号；`device: npu:auto` 还要求 Accelerate 可用，真实设备图在模型加载后校验。显存容量与 fake-quant 峰值会明确保持 `warning/not assessed`，不能由 doctor 返回码推断“模型一定放得下”。无法完成基础探测会给出明确的阻断原因。返回码 `0` 表示可以尝试开始分析，`2` 表示存在阻断项。
 
 ### 4. 运行
 
@@ -136,6 +140,27 @@ runtime:
 ```
 
 自定义函数接收模型路径、revision、device、dtype 和 loader 选项，可返回 `(model, tokenizer)`、`ModelBundle`，或包含 `model/tokenizer` 的 mapping。QuantPlan 核心不依赖 ModelSlim 的内部 `core`/`infra` Python API。
+
+多卡自定义 loader 不能再只返回 `(model, tokenizer)`，还要声明 placement：
+
+```python
+from quantplan.runtime import ModelBundle, ModelPlacement
+
+return ModelBundle(
+    model=model,
+    tokenizer=tokenizer,
+    model_id=model_path,
+    placement=ModelPlacement(
+        strategy="pre_sharded",
+        input_device="npu:0",
+        device_map=tuple(model_device_map.items()),
+    ),
+)
+```
+
+首期合同只接受单进程、同一加速后端、完整参数常驻不同卡的模块分片。运行时会记录模型参数设备、目标权重设备和 placement 哈希，并检查 embedding 输入设备、BF16、meta/offload 与 target 稳定性；多卡 logits 的 labels/mask 会在计算 NLL/KL 时搬到 logits 所在末卡，不搬运全量 logits。自定义 placement 返回后以它为准，配置中的具体设备只作为传给 loader 的放置请求；`npu:auto` 这类带后端的请求仍会强制核对 NPU/CUDA/XPU 前缀。未返回 placement 的旧 loader 则必须让实际输入设备与配置一致。
+
+显存仍不足时，不会在 QuantPlan 内重写一套层流式加载器。已选择复用 [`accuracy_bench`](https://github.com/Qiming-zhang-rondo/accuracy_bench) 的 `meta skeleton + indexed safetensors + layers_per_shard + streaming expert` 执行机制，当前审计基线为提交 `95dc32f`。它现有的 `ShardedBlockComparator` 是双 checkpoint 的精度对齐器，并非可直接返回 QuantPlan 单组 W4A8/W8A8 ΔNLL 的 loader；因此要通过独立 runner adapter 接入，不能把它伪装成 `ModelBundle`。详细边界见 [`docs/large-model-placement.md`](docs/large-model-placement.md)。
 
 如果模型确实由 Transformers 的 `AutoModelForImageTextToText` 加载，但本次只验证 text-only 前向，可以显式开启受控 fallback：
 
