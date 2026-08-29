@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from quantplan.domain.models import (
+    ApproximateMeasurement,
     GroupInventory,
     InterventionMeasurement,
     PlanEvaluation,
@@ -45,6 +46,8 @@ PROXY_SEMANTICS = (
     "analysis-only symmetric Linear/fused-expert fake-quant proxy; not ModelSlim-exact"
 )
 QUANTIZER_ID = "quantplan.symmetric_weight_activation_fake_quant/v1"
+FAST_METRIC_ID = "quantplan.gradient_weighted_local_qdq/v1"
+FAST_RMS_WEIGHT = 1.0
 CONTEXT_SCHEMA = "quantplan.torch-analysis-context/v2"
 PLACEMENT_SCHEMA = "quantplan.model-placement/v1"
 DEFAULT_LINEAR_EXCLUDE = BASE_SAFETY_EXCLUDES
@@ -170,6 +173,11 @@ class RuntimeProvenance:
     quantization_semantics: str
     target_inventory_sha256: str
     target_weight_dtypes: tuple[str, ...]
+    analysis_mode: str
+    evidence_metric: str
+    full_model_dataset_passes: int
+    backward_dataset_passes: int
+    local_block_replays: int
     created_at_utc: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -202,6 +210,11 @@ class RuntimeProvenance:
             "quantization_semantics": self.quantization_semantics,
             "target_inventory_sha256": self.target_inventory_sha256,
             "target_weight_dtypes": list(self.target_weight_dtypes),
+            "analysis_mode": self.analysis_mode,
+            "evidence_metric": self.evidence_metric,
+            "full_model_dataset_passes": self.full_model_dataset_passes,
+            "backward_dataset_passes": self.backward_dataset_passes,
+            "local_block_replays": self.local_block_replays,
             "created_at_utc": self.created_at_utc,
         }
 
@@ -213,7 +226,7 @@ class AnalysisRunResult:
     provenance: RuntimeProvenance
     baseline_nll: float
     token_count: int
-    measurements: tuple[InterventionMeasurement, ...]
+    measurements: tuple[InterventionMeasurement | ApproximateMeasurement, ...]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -847,9 +860,328 @@ class TorchAnalysisRuntime:
         return AnalysisRunResult(
             groups=self.groups,
             module_inventory=self.module_inventory,
-            provenance=self._provenance(),
+            provenance=self._provenance(
+                analysis_mode="exact",
+                evidence_metric="teacher_forced_delta_nll_per_token",
+                full_model_dataset_passes=(
+                    1
+                    + len(self._runtime_groups)
+                    * sum(item is not PrecisionFormat.BF16 for item in normalized)
+                    * (2 if self.compute_kl else 1)
+                ),
+                backward_dataset_passes=0,
+                local_block_replays=0,
+            ),
             baseline_nll=baseline.mean_nll,
             token_count=baseline.token_count,
+            measurements=tuple(measurements),
+        )
+
+    def run_fast(
+        self,
+        precisions: Sequence[PrecisionFormat | str] = (
+            PrecisionFormat.W4A8,
+            PrecisionFormat.W8A8,
+        ),
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> AnalysisRunResult:
+        """Rank group candidates with one full-model forward/backward sweep.
+
+        For each block, a local QDQ replay estimates its output perturbation.
+        The perturbation is contracted with the downstream teacher-forced NLL
+        gradient at that block output.  This is proposal evidence only; the
+        workflow still runs exact whole-model validation before emitting YAML.
+        """
+
+        normalized = tuple(_normalize_precision(value) for value in precisions)
+        if not normalized:
+            raise ValueError("precisions must not be empty")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("precisions must not contain duplicates")
+        if progress_callback is not None and not callable(progress_callback):
+            raise TypeError("progress_callback must be callable or None")
+
+        self._assert_context_integrity()
+        modules = dict(self.model.named_modules())
+        bindings: list[tuple[_RuntimeGroup, Any]] = []
+        block_owners: dict[int, str] = {}
+        for group in self._runtime_groups:
+            if len(group.block_module_names) != 1:
+                raise TorchAnalysisError(
+                    "fast mode requires exactly one block root per decision group; "
+                    f"{group.inventory.group_id!r} has {len(group.block_module_names)}"
+                )
+            block_name = group.block_module_names[0]
+            block = modules.get(block_name)
+            if block is None:
+                raise TorchAnalysisError(f"fast mode block root disappeared: {block_name!r}")
+            previous = block_owners.setdefault(id(block), group.inventory.group_id)
+            if previous != group.inventory.group_id:
+                raise TorchAnalysisError(
+                    f"fast mode groups {previous!r} and {group.inventory.group_id!r} "
+                    "share a block root"
+                )
+            bindings.append((group, block))
+
+        total = len(bindings) * len(normalized)
+        if progress_callback is not None:
+            for current, (group, precision) in enumerate(
+                (
+                    (group, precision)
+                    for group, _block in bindings
+                    for precision in normalized
+                ),
+                start=1,
+            ):
+                progress_callback(
+                    "measurement_start",
+                    current,
+                    total,
+                    group.inventory.group_id,
+                    precision.value,
+                )
+
+        stats = {
+            (group.inventory.group_id, precision): [0.0, 0.0, 0]
+            for group, _block in bindings
+            for precision in normalized
+        }
+        replaying: set[int] = set()
+        active_mask: Any | None = None
+        handles: list[Any] = []
+        started = time.perf_counter()
+        nll_sum = 0.0
+        token_count = 0
+
+        def make_pre_hook(group_id: str):
+            def enable_gradient(
+                _module: Any,
+                args: tuple[Any, ...],
+                kwargs: dict[str, Any],
+            ) -> tuple[tuple[Any, ...], dict[str, Any]] | None:
+                updated_args, updated_kwargs, changed = _enable_first_tensor_gradient(
+                    self._torch, args, kwargs
+                )
+                if not changed and not _tree_contains_grad_tensor(
+                    self._torch, (args, kwargs)
+                ):
+                    raise TorchAnalysisError(
+                        f"fast mode could not enable gradients at block {group_id!r}"
+                    )
+                return (updated_args, updated_kwargs) if changed else None
+
+            return enable_gradient
+
+        def make_post_hook(group: _RuntimeGroup):
+            group_id = group.inventory.group_id
+
+            def capture_and_replay(
+                module: Any,
+                args: tuple[Any, ...],
+                kwargs: dict[str, Any],
+                output: Any,
+            ) -> Any:
+                if id(module) in replaying:
+                    return output
+                baseline_tensor = _first_tensor(self._torch, output)
+                if baseline_tensor is None or baseline_tensor.ndim != 3:
+                    raise TorchAnalysisError(
+                        f"fast mode requires block {group_id!r} to expose a "
+                        "[batch, sequence, hidden] tensor output"
+                    )
+                if not baseline_tensor.requires_grad:
+                    raise TorchAnalysisError(
+                        f"fast mode block output {group_id!r} has no gradient path"
+                    )
+                if active_mask is None:
+                    raise TorchAnalysisError("fast mode block hook ran outside a calibration batch")
+                saved_args = _detach_tree(self._torch, args)
+                saved_kwargs = _detach_tree(self._torch, kwargs)
+                saved_baseline = baseline_tensor.detach()
+                mask = active_mask.detach()
+
+                def accumulate(gradient: Any) -> Any:
+                    if gradient is None or gradient.shape != saved_baseline.shape:
+                        raise TorchAnalysisError(
+                            f"fast mode received an invalid output gradient for {group_id!r}"
+                        )
+                    valid = _block_token_mask(self._torch, mask, gradient.shape[:2])
+                    valid_count = int(valid.sum().item())
+                    if valid_count == 0:
+                        return gradient
+                    identity = id(module)
+                    replaying.add(identity)
+                    try:
+                        for precision in normalized:
+                            if precision is PrecisionFormat.BF16:
+                                selected = self._torch.zeros(
+                                    valid_count,
+                                    dtype=self._torch.float32,
+                                    device=gradient.device,
+                                )
+                            else:
+                                with self._torch.no_grad():
+                                    candidate_output = self._fast_local_block_replay(
+                                        group,
+                                        module,
+                                        saved_args,
+                                        saved_kwargs,
+                                        precision,
+                                    )
+                                candidate_tensor = _first_tensor(self._torch, candidate_output)
+                                if (
+                                    candidate_tensor is None
+                                    or candidate_tensor.shape != saved_baseline.shape
+                                ):
+                                    raise TorchAnalysisError(
+                                        f"fast local replay shape mismatch for {group_id!r}/"
+                                        f"{precision.value}"
+                                    )
+                                delta = candidate_tensor.to(dtype=self._torch.float32) - (
+                                    saved_baseline.to(
+                                        device=candidate_tensor.device,
+                                        dtype=self._torch.float32,
+                                    )
+                                )
+                                local_gradient = gradient.to(
+                                    device=delta.device,
+                                    dtype=self._torch.float32,
+                                )
+                                effect = (local_gradient * delta).sum(dim=-1)
+                                selected = effect.masked_select(valid.to(effect.device))
+                                del candidate_output, candidate_tensor, delta, local_gradient, effect
+                            entry = stats[(group_id, precision)]
+                            entry[0] += float(selected.sum().item())
+                            entry[1] += float((selected * selected).sum().item())
+                            entry[2] += int(selected.numel())
+                            del selected
+                    finally:
+                        replaying.discard(identity)
+                    return gradient
+
+                baseline_tensor.register_hook(accumulate)
+                return output
+
+            return capture_and_replay
+
+        try:
+            for group, block in bindings:
+                handles.append(
+                    block.register_forward_pre_hook(
+                        make_pre_hook(group.inventory.group_id),
+                        with_kwargs=True,
+                    )
+                )
+                handles.append(
+                    block.register_forward_hook(
+                        make_post_hook(group),
+                        with_kwargs=True,
+                        always_call=True,
+                    )
+                )
+            with _evaluation_mode(self.model), _temporary_freeze_parameters(self.model):
+                for batch in self._batches():
+                    active_mask = batch["attention_mask"]
+                    with self._torch.enable_grad():
+                        logits = self._forward_logits(batch)
+                        loss_sum, batch_tokens = _nll_loss_sum_and_count(
+                            self._torch,
+                            logits,
+                            batch["input_ids"],
+                            batch["attention_mask"],
+                        )
+                        if batch_tokens:
+                            loss_sum.backward()
+                            nll_sum += float(loss_sum.detach().item())
+                            token_count += batch_tokens
+                        del logits, loss_sum
+                    active_mask = None
+        finally:
+            active_mask = None
+            for handle in reversed(handles):
+                handle.remove()
+
+        elapsed = time.perf_counter() - started
+        if token_count <= 0:
+            raise TorchAnalysisError("teacher-forced evaluation produced no target tokens")
+        self._assert_context_integrity()
+        self._baseline = _ForwardAggregate(nll_sum, token_count, elapsed)
+        measurements: list[ApproximateMeasurement] = []
+        for current, (group, precision) in enumerate(
+            (
+                (group, precision)
+                for group, _block in bindings
+                for precision in normalized
+            ),
+            start=1,
+        ):
+            signed_sum, square_sum, count = stats[(group.inventory.group_id, precision)]
+            if count != token_count:
+                raise TorchAnalysisError(
+                    "fast mode token accounting mismatch for "
+                    f"{group.inventory.group_id}/{precision.value}: {count} != {token_count}"
+                )
+            mean_effect = signed_sum / count
+            rms_effect = (max(0.0, square_sum) / count) ** 0.5
+            measurements.append(
+                ApproximateMeasurement(
+                    group_id=group.inventory.group_id,
+                    precision=precision,
+                    context_id=self.context_id,
+                    module_names=group.inventory.module_names,
+                    parameter_count=group.inventory.parameter_count,
+                    estimated_risk=abs(mean_effect) + FAST_RMS_WEIGHT * rms_effect,
+                    token_count=token_count,
+                    elapsed_seconds=elapsed,
+                    metric_id=FAST_METRIC_ID,
+                    mean_first_order_effect=mean_effect,
+                    rms_first_order_effect=rms_effect,
+                    warnings=(
+                        PROXY_SEMANTICS,
+                        "first-order local approximation; not an observed delta NLL",
+                        "elapsed_seconds is shared by all measurements in this fast run",
+                        *(
+                            (
+                                "compute_kl is ignored during fast ranking; "
+                                + "exact plan validation still computes KL",
+                            )
+                            if self.compute_kl
+                            else ()
+                        ),
+                        *(self.loader_warnings),
+                        *(group.inventory.warnings),
+                    ),
+                )
+            )
+            if progress_callback is not None:
+                progress_callback(
+                    "measurement_complete",
+                    current,
+                    total,
+                    group.inventory.group_id,
+                    precision.value,
+                )
+
+        non_reference_precisions = sum(
+            precision is not PrecisionFormat.BF16 for precision in normalized
+        )
+        return AnalysisRunResult(
+            groups=self.groups,
+            module_inventory=self.module_inventory,
+            provenance=self._provenance(
+                analysis_mode="fast",
+                evidence_metric=FAST_METRIC_ID,
+                full_model_dataset_passes=1,
+                backward_dataset_passes=1,
+                local_block_replays=(
+                    len(bindings)
+                    * non_reference_precisions
+                    * ((len(self.samples) + self.batch_size - 1) // self.batch_size)
+                ),
+            ),
+            baseline_nll=nll_sum / token_count,
+            token_count=token_count,
             measurements=tuple(measurements),
         )
 
@@ -1158,6 +1490,73 @@ class TorchAnalysisRuntime:
                     )
             yield
 
+    def _fast_local_block_replay(
+        self,
+        group: _RuntimeGroup,
+        block: Any,
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+        precision: PrecisionFormat,
+    ) -> Any:
+        """Replay one block with stateless QDQ parameter copies.
+
+        Mutating and restoring the original weights increments their autograd
+        version counter and invalidates the pending baseline backward pass.
+        Functional call keeps the reference model byte-for-byte untouched.
+        """
+
+        if precision is PrecisionFormat.BF16:
+            return block(*args, **kwargs)
+        weight_bits = 4 if precision is PrecisionFormat.W4A8 else 8
+        block_name = group.block_module_names[0]
+        modules = dict(self.model.named_modules())
+        parameter_overrides: dict[str, Any] = {}
+        linears: list[Any] = []
+        fused_targets: list[_BoundFusedTarget] = []
+
+        for module_name in group.linear_module_names:
+            relative = _relative_module_name(block_name, module_name)
+            parameter_name = f"{relative}.weight" if relative else "weight"
+            linear = modules[module_name]
+            parameter_overrides[parameter_name] = _fake_quant_parameter_copy(
+                self._torch, linear.weight, weight_bits
+            )
+            linears.append(linear)
+        for target in group.expert_targets:
+            relative = _relative_module_name(block_name, target.module_name)
+            target_module = modules[target.module_name]
+            for direct_name in target.parameter_names:
+                parameter_name = f"{relative}.{direct_name}" if relative else direct_name
+                parameter_overrides[parameter_name] = _fake_quant_parameter_copy(
+                    self._torch,
+                    getattr(target_module, direct_name),
+                    weight_bits,
+                )
+            fused_targets.append(
+                _BoundFusedTarget(
+                    module=target_module,
+                    parameter_names=target.parameter_names,
+                    activation_kwarg=target.activation_kwarg,
+                )
+            )
+        if not parameter_overrides:
+            raise TorchAnalysisError(
+                f"fast local replay found no parameters for {group.inventory.group_id!r}"
+            )
+        functional_call = _functional_call(self._torch)
+        with _temporary_activation_fake_quant(
+            linears,
+            fused_targets,
+            torch_module=self._torch,
+        ):
+            return functional_call(
+                block,
+                parameter_overrides,
+                args,
+                dict(kwargs),
+                strict=False,
+            )
+
     @staticmethod
     def _ensure_disjoint_linears(groups: Sequence[_RuntimeGroup]) -> None:
         owners: dict[str, str] = {}
@@ -1178,7 +1577,15 @@ class TorchAnalysisRuntime:
             warnings.append("BF16 candidate reuses the unmodified reference forward")
         return tuple(warnings)
 
-    def _provenance(self) -> RuntimeProvenance:
+    def _provenance(
+        self,
+        *,
+        analysis_mode: str,
+        evidence_metric: str,
+        full_model_dataset_passes: int,
+        backward_dataset_passes: int,
+        local_block_replays: int,
+    ) -> RuntimeProvenance:
         return RuntimeProvenance(
             context_id=self.context_id,
             context_schema=CONTEXT_SCHEMA,
@@ -1210,8 +1617,79 @@ class TorchAnalysisRuntime:
             quantization_semantics=PROXY_SEMANTICS,
             target_inventory_sha256=self.target_inventory_sha256,
             target_weight_dtypes=self.target_weight_dtypes,
+            analysis_mode=analysis_mode,
+            evidence_metric=evidence_metric,
+            full_model_dataset_passes=full_model_dataset_passes,
+            backward_dataset_passes=backward_dataset_passes,
+            local_block_replays=local_block_replays,
             created_at_utc=datetime.now(timezone.utc).isoformat(),
         )
+
+
+@contextmanager
+def _temporary_activation_fake_quant(
+    linears: Sequence[Any],
+    fused_targets: Sequence[_BoundFusedTarget],
+    *,
+    torch_module: Any,
+) -> Iterator[None]:
+    """Install activation-only A8 hooks for stateless fast block replay."""
+
+    torch = torch_module
+    handles: list[Any] = []
+
+    def linear_hook(_module: Any, inputs: tuple[Any, ...]) -> tuple[Any, ...] | None:
+        if not inputs or not torch.is_tensor(inputs[0]):
+            return None
+        return (_fake_quant_activation(torch, inputs[0], 8), *inputs[1:])
+
+    def fused_hook(target: _BoundFusedTarget):
+        def quantize(
+            _module: Any,
+            inputs: tuple[Any, ...],
+            kwargs: dict[str, Any],
+        ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+            if inputs and torch.is_tensor(inputs[0]):
+                return (
+                    (_fake_quant_activation(torch, inputs[0], 8), *inputs[1:]),
+                    kwargs,
+                )
+            hidden_states = kwargs.get(target.activation_kwarg)
+            if hidden_states is not None and torch.is_tensor(hidden_states):
+                updated = dict(kwargs)
+                updated[target.activation_kwarg] = _fake_quant_activation(
+                    torch, hidden_states, 8
+                )
+                return inputs, updated
+            raise TorchAnalysisError(
+                "fast fused replay could not observe an activation tensor at "
+                f"{target.activation_kwarg!r}"
+            )
+
+        return quantize
+
+    seen_linears: set[int] = set()
+    seen_fused: set[int] = set()
+    try:
+        for linear in linears:
+            if id(linear) in seen_linears:
+                continue
+            seen_linears.add(id(linear))
+            handles.append(linear.register_forward_pre_hook(linear_hook))
+        for target in fused_targets:
+            if id(target.module) in seen_fused:
+                continue
+            seen_fused.add(id(target.module))
+            handles.append(
+                target.module.register_forward_pre_hook(
+                    fused_hook(target),
+                    with_kwargs=True,
+                )
+            )
+        yield
+    finally:
+        for handle in reversed(handles):
+            handle.remove()
 
 
 @contextmanager
@@ -1462,6 +1940,49 @@ def _fake_quant_weight(torch: Any, value: Any, bits: int) -> Any:
     return quantized.to(dtype=value.dtype)
 
 
+def _fake_quant_parameter_copy(
+    torch: Any,
+    value: Any,
+    bits: int,
+    *,
+    row_chunk_size: int = 4096,
+) -> Any:
+    copied = value.detach().clone()
+    _fake_quantize_parameter_in_place(
+        torch,
+        copied,
+        bits,
+        row_chunk_size=row_chunk_size,
+    )
+    return copied
+
+
+def _relative_module_name(block_name: str, module_name: str) -> str:
+    if module_name == block_name:
+        return ""
+    prefix = f"{block_name}."
+    if not module_name.startswith(prefix):
+        raise TorchAnalysisError(
+            f"quantization target {module_name!r} is outside fast block root {block_name!r}"
+        )
+    return module_name[len(prefix) :]
+
+
+def _functional_call(torch: Any) -> Callable[..., Any]:
+    namespace = getattr(torch, "func", None)
+    call = getattr(namespace, "functional_call", None)
+    if callable(call):
+        return call
+    stateless = getattr(getattr(torch, "nn", None), "utils", None)
+    stateless = getattr(stateless, "stateless", None)
+    call = getattr(stateless, "functional_call", None)
+    if callable(call):
+        return call
+    raise TorchAnalysisError(
+        "fast mode requires torch.func.functional_call (or the legacy stateless equivalent)"
+    )
+
+
 def _fake_quantize_parameter_in_place(
     torch: Any,
     value: Any,
@@ -1497,10 +2018,19 @@ def _fake_quant_activation(torch: Any, value: Any, bits: int) -> Any:
 def _nll_sum_and_count(
     torch: Any, logits: Any, input_ids: Any, attention_mask: Any
 ) -> tuple[float, int]:
+    loss_sum, token_count = _nll_loss_sum_and_count(
+        torch, logits, input_ids, attention_mask
+    )
+    return float(loss_sum.detach().item()), token_count
+
+
+def _nll_loss_sum_and_count(
+    torch: Any, logits: Any, input_ids: Any, attention_mask: Any
+) -> tuple[Any, int]:
     if logits.shape[:2] != input_ids.shape:
         raise TorchAnalysisError("logits and input_ids batch/sequence dimensions must match")
     if input_ids.shape[1] < 2:
-        return 0.0, 0
+        return logits.sum() * 0.0, 0
     prediction = logits[:, :-1, :].to(dtype=torch.float32)
     labels = input_ids[:, 1:].to(prediction.device)
     # A valid next-token target requires both a real context token and a real
@@ -1514,7 +2044,7 @@ def _nll_sum_and_count(
         labels.reshape(-1),
         reduction="none",
     ).reshape_as(labels)
-    return float(losses.masked_select(valid).sum().item()), int(valid.sum().item())
+    return losses.masked_select(valid).sum(), int(valid.sum().item())
 
 
 def _kl_sum(torch: Any, reference_logits: Any, candidate_logits: Any, mask: Any) -> float:
@@ -1804,7 +2334,24 @@ def _group_inventory_to_dict(group: GroupInventory) -> dict[str, Any]:
     }
 
 
-def _measurement_to_dict(measurement: InterventionMeasurement) -> dict[str, Any]:
+def _measurement_to_dict(
+    measurement: InterventionMeasurement | ApproximateMeasurement,
+) -> dict[str, Any]:
+    if isinstance(measurement, ApproximateMeasurement):
+        return {
+            "group_id": measurement.group_id,
+            "precision": measurement.precision.value,
+            "context_id": measurement.context_id,
+            "module_names": list(measurement.module_names),
+            "parameter_count": measurement.parameter_count,
+            "estimated_risk": measurement.estimated_risk,
+            "token_count": measurement.token_count,
+            "elapsed_seconds": measurement.elapsed_seconds,
+            "metric_id": measurement.metric_id,
+            "mean_first_order_effect": measurement.mean_first_order_effect,
+            "rms_first_order_effect": measurement.rms_first_order_effect,
+            "warnings": list(measurement.warnings),
+        }
     return {
         "group_id": measurement.group_id,
         "precision": measurement.precision.value,
@@ -2329,6 +2876,101 @@ def _model_input_device(torch: Any, model: Any) -> Any:
         return next(model.parameters()).device
     except StopIteration:
         return torch.device("cpu")
+
+
+def _first_tensor(torch: Any, value: Any) -> Any | None:
+    if torch.is_tensor(value):
+        return value
+    if isinstance(value, Mapping):
+        for item in value.values():
+            found = _first_tensor(torch, item)
+            if found is not None:
+                return found
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            found = _first_tensor(torch, item)
+            if found is not None:
+                return found
+    return None
+
+
+def _detach_tree(torch: Any, value: Any) -> Any:
+    if torch.is_tensor(value):
+        return value.detach()
+    if isinstance(value, tuple):
+        return tuple(_detach_tree(torch, item) for item in value)
+    if isinstance(value, list):
+        return [_detach_tree(torch, item) for item in value]
+    if isinstance(value, Mapping):
+        return {key: _detach_tree(torch, item) for key, item in value.items()}
+    return value
+
+
+def _tree_contains_grad_tensor(torch: Any, value: Any) -> bool:
+    if torch.is_tensor(value):
+        return bool(value.is_floating_point() and value.requires_grad)
+    if isinstance(value, Mapping):
+        return any(_tree_contains_grad_tensor(torch, item) for item in value.values())
+    if isinstance(value, (tuple, list)):
+        return any(_tree_contains_grad_tensor(torch, item) for item in value)
+    return False
+
+
+def _enable_first_tensor_gradient(
+    torch: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> tuple[tuple[Any, ...], dict[str, Any], bool]:
+    found = False
+    changed = False
+
+    def update(value: Any) -> Any:
+        nonlocal found, changed
+        if found:
+            return value
+        if torch.is_tensor(value) and value.is_floating_point():
+            found = True
+            if value.requires_grad:
+                return value
+            changed = True
+            return value.detach().requires_grad_(True)
+        if isinstance(value, tuple):
+            return tuple(update(item) for item in value)
+        if isinstance(value, list):
+            return [update(item) for item in value]
+        if isinstance(value, Mapping):
+            return {key: update(item) for key, item in value.items()}
+        return value
+
+    updated_args = update(args)
+    updated_kwargs = update(kwargs) if not found else kwargs
+    return updated_args, updated_kwargs, changed
+
+
+def _block_token_mask(torch: Any, attention_mask: Any, shape: Sequence[int]) -> Any:
+    if len(shape) != 2 or tuple(attention_mask.shape) != tuple(shape):
+        raise TorchAnalysisError(
+            "fast mode requires block output and attention mask batch/sequence shapes to match"
+        )
+    valid = torch.zeros(tuple(shape), dtype=torch.bool, device=attention_mask.device)
+    if shape[1] > 1:
+        valid[:, :-1] = attention_mask[:, :-1].to(dtype=torch.bool) & attention_mask[
+            :, 1:
+        ].to(dtype=torch.bool)
+    return valid
+
+
+@contextmanager
+def _temporary_freeze_parameters(model: Any) -> Iterator[None]:
+    parameters = tuple(model.parameters())
+    flags = tuple(bool(parameter.requires_grad) for parameter in parameters)
+    try:
+        for parameter in parameters:
+            parameter.requires_grad_(False)
+        yield
+    finally:
+        for parameter, requires_grad in zip(parameters, flags, strict=True):
+            parameter.requires_grad_(requires_grad)
 
 
 @contextmanager

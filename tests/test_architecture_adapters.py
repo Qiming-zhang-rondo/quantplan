@@ -74,6 +74,15 @@ def test_registry_prefers_exact_qwen_adapter_and_keeps_generic_fallback() -> Non
     assert registry.resolve(_model("qwen3_5_moe_text")).adapter_id == QWEN35_MOE_ADAPTER_ID
 
 
+def test_qwen_adapter_locks_architecture_specific_unsafe_targets() -> None:
+    excludes = Qwen35MoeModelSlimAdapter().nonremovable_exclude_patterns
+
+    assert "*conv1d*" in excludes
+    assert "*linear_attn*" in excludes
+    assert "*.shared_expert_gate" in excludes
+    assert "*.shared_expert_gate.weight" in excludes
+
+
 def test_qwen_adapter_maps_fused_runtime_weights_to_audited_backend_names() -> None:
     adapter = Qwen35MoeModelSlimAdapter()
     parameters = {

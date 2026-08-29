@@ -21,6 +21,7 @@ from quantplan.adapters.modelslim import (
 )
 from quantplan.artifacts import ArtifactError, ArtifactStore
 from quantplan.domain import (
+    ApproximateMeasurement,
     GroupInventory,
     InterventionMeasurement,
     PlanEvaluation,
@@ -39,7 +40,7 @@ from quantplan.run_config import RunConfig
 class AnalysisResultLike(Protocol):
     groups: Sequence[GroupInventory]
     module_inventory: Sequence[str]
-    measurements: Sequence[InterventionMeasurement]
+    measurements: Sequence[InterventionMeasurement | ApproximateMeasurement]
     provenance: Any
 
 
@@ -50,6 +51,13 @@ class AnalysisRuntimeLike(Protocol):
     full_group_coverage: bool
 
     def run(
+        self,
+        precisions: Sequence[PrecisionFormat],
+        *,
+        progress_callback: Callable[[str, int, int, str, str], None] | None = None,
+    ) -> AnalysisResultLike: ...
+
+    def run_fast(
         self,
         precisions: Sequence[PrecisionFormat],
         *,
@@ -90,10 +98,13 @@ def execute_workflow(
     compiler: ModelSlimPlanCompiler | None = None,
     precision_templates: Mapping[PrecisionFormat, Mapping[str, Any]] | None = None,
     progress: Callable[[str, Mapping[str, Any]], None] | None = None,
+    analysis_mode: str = "exact",
 ) -> WorkflowResult:
     """Run the complete evidence loop with an already constructed runtime."""
 
     config.validate_for_run()
+    if analysis_mode not in {"exact", "fast"}:
+        raise ValueError("analysis_mode must be 'exact' or 'fast'")
     _prepare_output(config, overwrite=overwrite)
     store = ArtifactStore(config.output_dir, overwrite=overwrite)
     manifest_store = ArtifactStore(config.output_dir, overwrite=True)
@@ -103,6 +114,7 @@ def execute_workflow(
         config,
         status="running",
         started_at=started_at,
+        details={"analysis_mode": analysis_mode},
     )
 
     try:
@@ -146,8 +158,13 @@ def execute_workflow(
             codes = ", ".join(issue.code for issue in source_guard.blocking_issues)
             raise RuntimeError(f"source ModelSlim YAML failed static policy: {codes}")
 
-        _progress(progress, "analysis_started", {"groups": len(runtime.groups)})
-        result = runtime.run(
+        _progress(
+            progress,
+            "analysis_started",
+            {"groups": len(runtime.groups), "analysis_mode": analysis_mode},
+        )
+        analysis_runner = runtime.run if analysis_mode == "exact" else runtime.run_fast
+        result = analysis_runner(
             config.candidates.precisions,
             progress_callback=_measurement_progress(progress),
         )
@@ -161,7 +178,11 @@ def execute_workflow(
         _progress(
             progress,
             "analysis_completed",
-            {"groups": len(groups), "measurements": len(measurements)},
+            {
+                "groups": len(groups),
+                "measurements": len(measurements),
+                "analysis_mode": analysis_mode,
+            },
         )
 
         store.write_jsonl(
@@ -187,7 +208,12 @@ def execute_workflow(
 
         candidate_payload = {
             "schema_version": "quantplan.candidate-set/v1",
-            "claim": "unvalidated proposals from the explicitly measured candidate set",
+            "analysis_mode": analysis_mode,
+            "claim": (
+                "unvalidated proposals from candidate-specific whole-model interventions"
+                if analysis_mode == "exact"
+                else "unvalidated proposals from gradient-weighted local approximations"
+            ),
             "max_estimated_cost": candidate_set.max_estimated_cost,
             "rejected_reasons": list(candidate_set.rejected_reasons),
             "plans": [_plan_payload(plan) for plan in candidate_set.plans],
@@ -199,6 +225,8 @@ def execute_workflow(
             candidate_set.plans,
             key=lambda item: (item.estimated_cost, item.proposal_score),
         )
+        if analysis_mode == "fast":
+            ordered_plans = ordered_plans[:3]
         for index, plan in enumerate(ordered_plans, start=1):
             identifier = plan_id(plan)
             _progress(
@@ -220,12 +248,14 @@ def execute_workflow(
             )
 
         selected = choose_lowest_cost_passing_plan(
-            candidate_set.plans,
+            ordered_plans,
             evaluations,
             max_delta_nll=config.search.max_delta_nll,
         )
         validation_payload = {
             "schema_version": "quantplan.validation-report/v1",
+            "analysis_mode": analysis_mode,
+            "validation_cap": 3 if analysis_mode == "fast" else None,
             "gate": {
                 "metric": "teacher_forced_delta_nll_per_token",
                 "maximum": config.search.max_delta_nll,
@@ -236,6 +266,14 @@ def execute_workflow(
             "scope": "full_group_inventory" if full_group_coverage else "pilot_subset",
             "limitations": [
                 "fake-quant proxy evidence is not ModelSlim-exact",
+                *(
+                    [
+                        "fast proposal scores are first-order local approximations, not delta NLL",
+                        "fast mode exactly validates at most the three cheapest proposals",
+                    ]
+                    if analysis_mode == "fast"
+                    else []
+                ),
                 "target-hardware execution readiness is not assessed",
                 "task accuracy and hardware performance require independent validation",
                 *(
@@ -255,6 +293,7 @@ def execute_workflow(
                 store,
                 config,
                 result.provenance,
+                analysis_mode=analysis_mode,
                 validation_report_path=validation_report_path,
             )
             _write_manifest(
@@ -262,7 +301,10 @@ def execute_workflow(
                 config,
                 status="plan_validation_failed",
                 started_at=started_at,
-                details={"evaluated_plan_count": len(evaluations)},
+                details={
+                    "analysis_mode": analysis_mode,
+                    "evaluated_plan_count": len(evaluations),
+                },
             )
             return WorkflowResult(
                 status="plan_validation_failed",
@@ -278,6 +320,7 @@ def execute_workflow(
                 store,
                 config,
                 result.provenance,
+                analysis_mode=analysis_mode,
                 validation_report_path=validation_report_path,
                 selected_plan=selected_plan,
                 selected_evaluation=selected_evaluation,
@@ -290,6 +333,7 @@ def execute_workflow(
                 started_at=started_at,
                 details={
                     "selected_plan_id": identifier,
+                    "analysis_mode": analysis_mode,
                     "selected_group_count": len(groups),
                     "discovered_group_count": discovered_group_count,
                     "derived_yaml_emitted": False,
@@ -319,6 +363,7 @@ def execute_workflow(
                 store,
                 config,
                 result.provenance,
+                analysis_mode=analysis_mode,
                 validation_report_path=validation_report_path,
                 selected_plan=selected_plan,
                 selected_evaluation=selected_evaluation,
@@ -330,6 +375,7 @@ def execute_workflow(
                 started_at=started_at,
                 details={
                     "selected_plan_id": plan_id(selected_plan),
+                    "analysis_mode": analysis_mode,
                     "blockers": list(blockers),
                     "derived_yaml_emitted": False,
                 },
@@ -407,6 +453,7 @@ def execute_workflow(
             store,
             config,
             result.provenance,
+            analysis_mode=analysis_mode,
             validation_report_path=validation_report_path,
             selected_plan=selected_plan,
             selected_evaluation=selected_evaluation,
@@ -420,6 +467,7 @@ def execute_workflow(
             started_at=started_at,
             details={
                 "selected_plan_id": plan_id(selected_plan),
+                "analysis_mode": analysis_mode,
                 "derived_yaml_sha256": compilation.sidecar.derived_sha256,
                 "execution_readiness": "not_assessed",
             },
@@ -442,7 +490,11 @@ def execute_workflow(
             config,
             status="failed",
             started_at=started_at,
-            details={"error_type": type(exc).__name__, "message": str(exc)},
+            details={
+                "analysis_mode": analysis_mode,
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            },
         )
         raise
 
@@ -474,6 +526,7 @@ def _write_provenance(
     config: RunConfig,
     runtime_provenance: Any,
     *,
+    analysis_mode: str,
     validation_report_path: Path,
     selected_plan: QuantPlan | None = None,
     selected_evaluation: PlanEvaluation | None = None,
@@ -496,6 +549,7 @@ def _write_provenance(
     }
     dataset_binding = _dataset_binding(config, runtime_payload)
     evidence_binding: dict[str, Any] = {
+        "analysis_mode": analysis_mode,
         "selected_plan_id": plan_id(selected_plan) if selected_plan else None,
         "context_id": selected_plan.context_id if selected_plan else None,
         "validation_report": validation_binding,
@@ -555,10 +609,15 @@ def _dataset_binding(
     }
 
 
-def _measurement_payload(item: InterventionMeasurement) -> dict[str, Any]:
+def _measurement_payload(
+    item: InterventionMeasurement | ApproximateMeasurement,
+) -> dict[str, Any]:
     payload = _jsonable(item)
-    payload["delta_nll"] = item.delta_nll
-    payload["evidence_role"] = "candidate-specific whole-model intervention"
+    if isinstance(item, InterventionMeasurement):
+        payload["delta_nll"] = item.delta_nll
+        payload["evidence_role"] = "candidate-specific whole-model intervention"
+    else:
+        payload["evidence_role"] = "gradient-weighted local approximation"
     return payload
 
 

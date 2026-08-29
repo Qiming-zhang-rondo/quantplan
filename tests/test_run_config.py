@@ -50,6 +50,7 @@ def test_minimal_config_has_conservative_defaults_and_anchors_paths(tmp_path: Pa
         "*visual*",
         "*mtp*",
         "*.mlp.gate",
+        "*.mlp.gate.weight",
         "*router*",
     )
     assert config.candidates.precisions == (

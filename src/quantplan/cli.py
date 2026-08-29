@@ -134,6 +134,7 @@ def _run(args: argparse.Namespace) -> int:
         runtime,
         overwrite=args.overwrite,
         progress=_print_progress,
+        analysis_mode=args.mode,
     )
     print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
     successful = {"complete_analysis_only", "complete_partial_analysis"}
@@ -199,6 +200,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="analyze, plan, validate and emit a guarded ModelSlim YAML",
     )
     run_parser.add_argument("--config", type=Path, required=True)
+    run_parser.add_argument(
+        "--mode",
+        choices=("exact", "fast"),
+        default="exact",
+        help="exact full-model interventions or fast gradient-weighted local ranking",
+    )
     run_parser.add_argument(
         "--overwrite",
         action="store_true",

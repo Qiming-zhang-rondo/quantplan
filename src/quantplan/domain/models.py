@@ -166,6 +166,49 @@ class InterventionMeasurement:
 
 
 @dataclass(frozen=True)
+class ApproximateMeasurement:
+    """Fast proposal evidence; never an observed whole-model loss change.
+
+    ``estimated_risk`` is produced from a local candidate perturbation and a
+    downstream loss gradient.  It may rank candidates, but it must be followed
+    by :class:`PlanEvaluation` before a deployable YAML can be emitted.
+    """
+
+    group_id: str
+    precision: PrecisionFormat
+    context_id: str
+    module_names: tuple[str, ...]
+    parameter_count: int
+    estimated_risk: float
+    token_count: int
+    elapsed_seconds: float
+    metric_id: str
+    mean_first_order_effect: float
+    rms_first_order_effect: float
+    warnings: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.group_id or not self.context_id or not self.metric_id:
+            raise ValueError("group_id, context_id and metric_id must not be empty")
+        if not self.module_names:
+            raise ValueError("module_names must not be empty")
+        if self.parameter_count < 1:
+            raise ValueError("parameter_count must be positive")
+        if self.token_count < 1:
+            raise ValueError("token_count must be positive")
+        for name in (
+            "estimated_risk",
+            "elapsed_seconds",
+            "rms_first_order_effect",
+        ):
+            value = getattr(self, name)
+            if not isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if not isfinite(self.mean_first_order_effect):
+            raise ValueError("mean_first_order_effect must be finite")
+
+
+@dataclass(frozen=True)
 class PlanEvaluation:
     """Whole-model validation of one complete mixed-precision assignment."""
 

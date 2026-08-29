@@ -3,6 +3,7 @@ from dataclasses import replace
 import pytest
 
 from quantplan.domain import (
+    ApproximateMeasurement,
     GroupInventory,
     InterventionMeasurement,
     PlanEvaluation,
@@ -90,6 +91,33 @@ def test_negative_delta_is_kept_only_as_a_warning_for_planning() -> None:
     )
     assert w4.risk == 0
     assert "negative delta NLL" in w4.warnings[0]
+
+
+def test_candidate_set_uses_fast_risk_without_inventing_delta_nll() -> None:
+    inventory = GroupInventory("block_0", ("layers.0.fc",), 100)
+    measurement = ApproximateMeasurement(
+        group_id="block_0",
+        precision=PrecisionFormat.W4A8,
+        context_id="ctx",
+        module_names=inventory.module_names,
+        parameter_count=100,
+        estimated_risk=0.125,
+        token_count=128,
+        elapsed_seconds=1.0,
+        metric_id="fast-v1",
+        mean_first_order_effect=-0.02,
+        rms_first_order_effect=0.105,
+    )
+
+    result = build_candidate_set(
+        (inventory,),
+        (measurement,),
+        allowed_formats=(PrecisionFormat.W4A8,),
+    )
+
+    w4 = next(item for item in result.evidence if item.precision is PrecisionFormat.W4A8)
+    assert w4.risk == pytest.approx(0.125)
+    assert not hasattr(measurement, "delta_nll")
 
 
 def test_choose_lowest_cost_plan_uses_whole_plan_validation() -> None:

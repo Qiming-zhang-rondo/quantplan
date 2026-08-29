@@ -8,6 +8,7 @@ import pytest
 from quantplan.adapters.modelslim import inspect_modelslim_yaml
 from quantplan.artifacts import ArtifactError
 from quantplan.domain import (
+    ApproximateMeasurement,
     GroupInventory,
     InterventionMeasurement,
     PlanEvaluation,
@@ -84,6 +85,55 @@ class _FailingPlanRuntime(_FakeRuntime):
         )
 
 
+class _FastRuntime(_FakeRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.exact_run_called = False
+        self.fast_run_called = False
+        self.evaluated_plan_ids = []
+
+    def run(self, precisions, *, progress_callback=None):
+        self.exact_run_called = True
+        return super().run(precisions, progress_callback=progress_callback)
+
+    def run_fast(self, precisions, *, progress_callback=None):
+        del progress_callback
+        self.fast_run_called = True
+        risks = {
+            ("block_0", PrecisionFormat.W4A8): 0.2,
+            ("block_0", PrecisionFormat.W8A8): 0.01,
+            ("block_1", PrecisionFormat.W4A8): 0.02,
+            ("block_1", PrecisionFormat.W8A8): 0.01,
+        }
+        measurements = tuple(
+            ApproximateMeasurement(
+                group_id=group.group_id,
+                precision=precision,
+                context_id="toy-context",
+                module_names=group.module_names,
+                parameter_count=group.parameter_count,
+                estimated_risk=risks[(group.group_id, precision)],
+                token_count=64,
+                elapsed_seconds=0.1,
+                metric_id="fast-v1",
+                mean_first_order_effect=0.0,
+                rms_first_order_effect=risks[(group.group_id, precision)],
+            )
+            for group in self.groups
+            for precision in precisions
+        )
+        return SimpleNamespace(
+            groups=self.groups,
+            module_inventory=self.module_inventory,
+            measurements=measurements,
+            provenance={"runtime": "toy-fast", "dataset_sha256": "a" * 64},
+        )
+
+    def evaluate_plan(self, assignments, *, plan_id):
+        self.evaluated_plan_ids.append(plan_id)
+        return super().evaluate_plan(assignments, plan_id=plan_id)
+
+
 class _PartialRuntime(_FakeRuntime):
     def __init__(self) -> None:
         super().__init__()
@@ -148,6 +198,29 @@ def test_workflow_emits_yaml_only_after_a_plan_passes(tmp_path: Path) -> None:
     assert (output / "run-manifest.json").read_text(encoding="utf-8").find(
         "complete_analysis_only"
     ) > 0
+
+
+def test_fast_workflow_uses_approximate_ranking_then_exact_validation(
+    tmp_path: Path,
+) -> None:
+    config, output = _make_config(tmp_path)
+    runtime = _FastRuntime()
+
+    result = execute_workflow(config, runtime, analysis_mode="fast")
+
+    assert result.status == "complete_analysis_only"
+    assert runtime.fast_run_called is True
+    assert runtime.exact_run_called is False
+    assert 1 <= len(runtime.evaluated_plan_ids) <= 3
+    evidence = [
+        json.loads(line)
+        for line in (output / "risk-evidence.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert all(item["evidence_role"] == "gradient-weighted local approximation" for item in evidence)
+    assert all("delta_nll" not in item for item in evidence)
+    report = json.loads((output / "validation-report.json").read_text(encoding="utf-8"))
+    assert report["analysis_mode"] == "fast"
+    assert report["validation_cap"] == 3
 
 
 def test_provenance_binds_selection_validation_config_and_dataset(

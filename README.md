@@ -96,6 +96,32 @@ quantplan doctor --config quantplan-run.yaml
 quantplan run --config quantplan-run.yaml
 ```
 
+默认是精确模式。40 个 Block、2 个候选精度且 KL 关闭时，提案阶段需要
+`1 + 40 × 2 = 81` 次整模型数据集前向，随后最多精确复测 8 个组合：
+
+```bash
+quantplan run --config quantplan-run.yaml --mode exact
+```
+
+快速模式使用一次完整数据集前向和一次反向获得各 Block 输出对
+teacher-forced NLL 的梯度，再分别对 W4A8/W8A8 做 Block 局部无状态重放：
+
+```bash
+quantplan run --config quantplan-run.yaml --mode fast
+```
+
+对某个 Block 和候选精度，Fast V1 计算每个有效 token 的一阶影响
+`z = sum(输出梯度 × 候选输出差)`，排序风险为
+`abs(mean(z)) + rms(z)`。它同时考虑候选量化误差和该误差对最终 NLL 的影响，
+但仍是局部一阶近似，不是整模型 `delta_nll`。Fast 最多精确复测成本最低的 3 个
+完整组合；只有复测通过才会生成 YAML。
+
+Fast 将模型参数冻结，因此不产生权重梯度，并且用无状态量化副本局部重放，
+不改写原模型权重。它仍需保留一次反向所需的激活，显存可能明显高于纯前向；
+不支持反向、Block 输出不是 `[batch, sequence, hidden]`、或一个决策组跨多个
+Block root 时会明确阻断，不会悄悄退回低可信指标。对 GLM、DeepSeek、Kimi 等
+新适配器，必须先在小规模 exact 对照上验证 Fast 排序相关性。
+
 运行顺序：
 
 1. 加载模型并发现 Block、普通 Linear 和 fused expert target；
@@ -120,10 +146,11 @@ quantplan run --config quantplan-run.yaml --overwrite
 - 8 个均匀覆盖深度的 Block；
 - 16 条文本、最长 512 tokens、batch size 1；
 - 25% 高精度预算；
-- 最多复测 8 个组合候选；
+- exact 最多复测 8 个组合候选，fast 最多复测 3 个；
 - teacher-forced ΔNLL/token 上限 0.02；
 - KL 关闭；
-- Vision、Visual、MTP、router 和 `.mlp.gate` 默认排除；
+- Vision、Visual、MTP、router 和 `.mlp.gate` 默认排除；Qwen3.5 还锁定
+  `conv1d`、`linear_attn` 和 `shared_expert_gate`；
 - 未识别 expert target 默认 fail-closed。
 
 这些参数只用于第一次内网 smoke。默认只分析 8 个 Block，因此只输出证据和候选诊断，**不会生成派生 YAML**。运行正常后，必须将 `analysis.max_groups` 调整到不少于实际发现的 Block 数（Qwen3.5-35B-A3B 预期为 40）才允许编译完整计划；同时可按预算提高 `max_samples` 和 `max_length`。`search.costs` 是归一化规划代理，不是硬件延迟或显存实测。
@@ -179,7 +206,8 @@ runtime:
 ## 输出产物
 
 - `model-inventory.json`：Block、量化 target、参数量和覆盖警告；
-- `risk-evidence.jsonl`：每个 Block/精度的整模型 ΔNLL 证据；
+- `risk-evidence.jsonl`：exact 为每个 Block/精度的整模型 ΔNLL；fast 为明确标记的
+  梯度加权局部风险，不含伪造的 `delta_nll` 字段；
 - `candidate-plan.json`：成本受限候选及完整 assignments；
 - `validation-report.json`：完整组合方案复测与冻结门槛；
 - `derived-modelslim.yaml`：通过门槛后才出现；

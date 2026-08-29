@@ -17,9 +17,17 @@ from typing import Any, Protocol, runtime_checkable
 BASE_SAFETY_EXCLUDES = (
     "*router*",
     "*.mlp.gate",
+    "*.mlp.gate.weight",
     "*mtp*",
     "*vision*",
     "*visual*",
+)
+QWEN35_SAFETY_EXCLUDES = (
+    *BASE_SAFETY_EXCLUDES,
+    "*conv1d*",
+    "*linear_attn*",
+    "*.shared_expert_gate",
+    "*.shared_expert_gate.weight",
 )
 GENERIC_ADAPTER_ID = "generic.nn_linear/v1"
 QWEN35_MODELSLIM_COMMIT = "376e2fad43bc999f9a49b48bdbc3eef06ffdd83a"
@@ -145,7 +153,7 @@ class Qwen35MoeModelSlimAdapter:
         "model.language_model.layers",
         "model.layers",
     )
-    nonremovable_exclude_patterns: tuple[str, ...] = BASE_SAFETY_EXCLUDES
+    nonremovable_exclude_patterns: tuple[str, ...] = QWEN35_SAFETY_EXCLUDES
     allow_block_path_fallback: bool = False
 
     def matches(self, model: Any, config: Any | None = None) -> bool:
@@ -419,6 +427,7 @@ __all__ = [
     "GENERIC_ADAPTER_ID",
     "QWEN35_MODELSLIM_COMMIT",
     "QWEN35_MOE_ADAPTER_ID",
+    "QWEN35_SAFETY_EXCLUDES",
     "ArchitectureAdapter",
     "ArchitectureAdapterError",
     "ArchitectureAdapterRegistrationError",

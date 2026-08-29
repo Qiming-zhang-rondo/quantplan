@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from math import isclose, isfinite
 
 from quantplan.domain import (
+    ApproximateMeasurement,
     CandidateEvidence,
     DecisionGroup,
     GroupInventory,
@@ -61,13 +62,13 @@ class CandidateSet:
 
 def build_candidate_set(
     inventories: Sequence[GroupInventory],
-    measurements: Iterable[InterventionMeasurement],
+    measurements: Iterable[InterventionMeasurement | ApproximateMeasurement],
     *,
     allowed_formats: Sequence[PrecisionFormat],
     policy: PlanningPolicy | None = None,
     relative_costs: Mapping[PrecisionFormat, float] = DEFAULT_RELATIVE_COSTS,
 ) -> CandidateSet:
-    """Build cost-bounded plans from candidate-specific full-forward evidence.
+    """Build cost-bounded plans from one homogeneous evidence family.
 
     A negative observed delta NLL is treated as measurement noise for planning
     and clipped to zero.  The raw signed value remains in the measurement
@@ -91,19 +92,27 @@ def build_candidate_set(
     if len(context_ids) != 1:
         raise ValueError(f"measurements use different contexts: {sorted(context_ids)}")
     context_id = next(iter(context_ids))
-    baseline_nll = measured[0].baseline_nll
+    evidence_types = {type(item) for item in measured}
+    if len(evidence_types) != 1:
+        raise ValueError("exact and approximate measurements cannot be mixed")
     token_count = measured[0].token_count
+    if isinstance(measured[0], InterventionMeasurement):
+        baseline_nll = measured[0].baseline_nll
+        for item in measured[1:]:
+            assert isinstance(item, InterventionMeasurement)
+            if not isclose(item.baseline_nll, baseline_nll, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError(
+                    "measurements with the same context_id have different baseline NLL values"
+                )
     for item in measured[1:]:
-        if not isclose(item.baseline_nll, baseline_nll, rel_tol=0.0, abs_tol=1e-12):
-            raise ValueError(
-                "measurements with the same context_id have different baseline NLL values"
-            )
         if item.token_count != token_count:
             raise ValueError(
                 "measurements with the same context_id have different token counts"
             )
 
-    by_key: dict[tuple[str, PrecisionFormat], InterventionMeasurement] = {}
+    by_key: dict[
+        tuple[str, PrecisionFormat], InterventionMeasurement | ApproximateMeasurement
+    ] = {}
     evidence: list[CandidateEvidence] = []
     for item in measured:
         inventory = inventory_by_id.get(item.group_id)
@@ -123,17 +132,23 @@ def build_candidate_set(
                 f"duplicate measurement for {item.group_id}/{item.precision.value}"
             )
         by_key[key] = item
-        signed_delta = item.delta_nll
         warnings = list(item.warnings)
-        if signed_delta < 0:
-            warnings.append("negative delta NLL clipped to zero for proposal ranking")
-        kl = item.kl_divergence or 0.0
+        if isinstance(item, InterventionMeasurement):
+            signed_delta = item.delta_nll
+            if signed_delta < 0:
+                warnings.append("negative delta NLL clipped to zero for proposal ranking")
+            kl = item.kl_divergence or 0.0
+            risk = max(0.0, signed_delta) + policy.kl_weight * kl
+        else:
+            if policy.kl_weight:
+                warnings.append("KL weight ignored for approximate fast evidence")
+            risk = item.estimated_risk
         evidence.append(
             CandidateEvidence(
                 group_id=item.group_id,
                 precision=item.precision,
                 context_id=context_id,
-                risk=max(0.0, signed_delta) + policy.kl_weight * kl,
+                risk=risk,
                 estimated_cost=(
                     item.parameter_count * float(relative_costs[item.precision])
                 ),

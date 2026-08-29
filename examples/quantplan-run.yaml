@@ -23,7 +23,7 @@ runtime:
 modules:
   block_patterns: []
   include: []
-  exclude: ["*vision*", "*visual*", "*mtp*", "*.mlp.gate", "*router*"]
+  exclude: ["*vision*", "*visual*", "*mtp*", "*.mlp.gate", "*.mlp.gate.weight", "*router*"]
 
 # Candidate presence is a hypothesis, not a backend support claim.
 candidates:

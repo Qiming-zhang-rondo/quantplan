@@ -12,6 +12,7 @@ from quantplan.runtime import (
     QWEN35_MOE_ADAPTER_ID,
     ModelBundle,
     ModelPlacement,
+    Qwen35MoeModelSlimAdapter,
     TorchAnalysisError,
     TorchAnalysisRuntime,
     TorchDependencyError,
@@ -160,9 +161,23 @@ def test_qwen_target_filters_keep_gate_proj_and_lock_router_gate() -> None:
     assert not torch_analysis._target_selected(
         "model.language_model.layers.0.mlp.gate", include, exclude
     )
+    assert not torch_analysis._target_selected(
+        "model.language_model.layers.0.mlp.gate.weight", include, exclude
+    )
     assert torch_analysis._target_selected(
         "model.language_model.layers.0.mlp.gate_proj", include, exclude
     )
+
+    qwen_exclude = torch_analysis._effective_exclude_patterns(
+        (), adapter=Qwen35MoeModelSlimAdapter()
+    )
+    for unsafe_name in (
+        "model.language_model.layers.0.linear_attn.in_proj",
+        "model.language_model.layers.0.linear_attn.conv1d",
+        "model.language_model.layers.0.mlp.shared_expert_gate",
+        "model.language_model.layers.0.mlp.shared_expert_gate.weight",
+    ):
+        assert not torch_analysis._target_selected(unsafe_name, include, qwen_exclude)
 
 
 def test_uniform_group_selection_spans_full_depth() -> None:
@@ -321,6 +336,9 @@ def test_toy_runtime_discovers_fused_experts_excludes_router_and_restores() -> N
     assert result.provenance.target_devices == ("cpu",)
     assert len(result.provenance.placement_sha256) == 64
     assert result.provenance.target_weight_dtypes == ("torch.bfloat16",)
+    assert result.provenance.analysis_mode == "exact"
+    assert result.provenance.full_model_dataset_passes == 3
+    assert result.provenance.backward_dataset_passes == 0
     assert len(result.provenance.target_inventory_sha256) == 64
     assert runtime.backend_compilation_ready is True
     assert runtime.backend_adapter == QWEN35_MOE_ADAPTER_ID
@@ -353,6 +371,56 @@ def test_toy_runtime_discovers_fused_experts_excludes_router_and_restores() -> N
     ]
     _assert_state_equal(torch, model, before)
     assert all(not module._forward_pre_hooks for module in model.modules())
+
+
+def test_fast_runtime_produces_finite_approximate_risk_and_restores() -> None:
+    torch = _torch_or_skip()
+    model, tokenizer = _toy_objects(torch)
+    before = _state_snapshot(model)
+    requires_grad_before = tuple(parameter.requires_grad for parameter in model.parameters())
+    runtime = TorchAnalysisRuntime(
+        model,
+        tokenizer,
+        ["hello", "quant plan"],
+        batch_size=1,
+        linear_exclude=(),
+        max_groups=2,
+    )
+
+    result = runtime.run_fast((PrecisionFormat.W4A8, PrecisionFormat.W8A8))
+
+    assert len(result.measurements) == 4
+    assert result.provenance.analysis_mode == "fast"
+    assert result.provenance.full_model_dataset_passes == 1
+    assert result.provenance.backward_dataset_passes == 1
+    assert result.provenance.local_block_replays == 8
+    assert all(item.estimated_risk >= 0 for item in result.measurements)
+    assert all(item.metric_id.endswith("/v1") for item in result.measurements)
+    assert all(not hasattr(item, "delta_nll") for item in result.measurements)
+    assert tuple(parameter.requires_grad for parameter in model.parameters()) == requires_grad_before
+    _assert_state_equal(torch, model, before)
+    assert all(not module._forward_pre_hooks for module in model.modules())
+    assert all(not module._forward_hooks for module in model.modules())
+
+
+def test_fast_runtime_failure_restores_hooks_parameters_and_grad_flags(monkeypatch) -> None:
+    torch = _torch_or_skip()
+    model, tokenizer = _toy_objects(torch)
+    before = _state_snapshot(model)
+    requires_grad_before = tuple(parameter.requires_grad for parameter in model.parameters())
+    runtime = TorchAnalysisRuntime(model, tokenizer, ["hello"], max_groups=1)
+
+    def fail_replay(*_args, **_kwargs):
+        raise RuntimeError("intentional fast replay failure")
+
+    monkeypatch.setattr(runtime, "_fast_local_block_replay", fail_replay)
+    with pytest.raises(RuntimeError, match="intentional fast replay failure"):
+        runtime.run_fast((PrecisionFormat.W4A8,))
+
+    assert tuple(parameter.requires_grad for parameter in model.parameters()) == requires_grad_before
+    _assert_state_equal(torch, model, before)
+    assert all(not module._forward_pre_hooks for module in model.modules())
+    assert all(not module._forward_hooks for module in model.modules())
 
 
 def test_runtime_context_fingerprint_binds_experiment_inputs(monkeypatch) -> None:

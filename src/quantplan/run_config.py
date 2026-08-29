@@ -77,6 +77,7 @@ class ModuleSelectionConfig:
         "*visual*",
         "*mtp*",
         "*.mlp.gate",
+        "*.mlp.gate.weight",
         "*router*",
     )
 
@@ -481,7 +482,14 @@ def parse_run_config(
         exclude=_strings(
             modules_doc.get(
                 "exclude",
-                ["*vision*", "*visual*", "*mtp*", "*.mlp.gate", "*router*"],
+                [
+                    "*vision*",
+                    "*visual*",
+                    "*mtp*",
+                    "*.mlp.gate",
+                    "*.mlp.gate.weight",
+                    "*router*",
+                ],
             ),
             "$.modules.exclude",
         ),
@@ -834,7 +842,7 @@ runtime:
 modules:
   block_patterns: []
   include: []
-  exclude: ["*vision*", "*visual*", "*mtp*", "*.mlp.gate", "*router*"]
+  exclude: ["*vision*", "*visual*", "*mtp*", "*.mlp.gate", "*.mlp.gate.weight", "*router*"]
 
 # Candidate presence is a hypothesis, not a backend support claim.
 candidates:

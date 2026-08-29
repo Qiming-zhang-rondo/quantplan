@@ -1,4 +1,5 @@
 from .models import (
+    ApproximateMeasurement,
     CandidateEvidence,
     DecisionGroup,
     GroupInventory,
@@ -10,6 +11,7 @@ from .models import (
 )
 
 __all__ = [
+    "ApproximateMeasurement",
     "CandidateEvidence",
     "DecisionGroup",
     "GroupInventory",
