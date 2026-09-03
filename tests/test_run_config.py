@@ -44,6 +44,7 @@ def test_minimal_config_has_conservative_defaults_and_anchors_paths(tmp_path: Pa
     assert config.runtime.allow_image_text_fallback is False
     assert config.runtime.strict_target_coverage is True
     assert config.runtime.hardware_profile == "unknown"
+    assert config.runtime.inference_framework == "auto"
     assert config.modules.block_patterns == ()
     assert config.modules.include == ()
     assert config.modules.exclude == (
@@ -87,6 +88,7 @@ def test_full_config_accepts_custom_loader_selectors_candidates_and_costs(
             "allow_image_text_fallback": True,
             "strict_target_coverage": False,
             "hardware_profile": "A5",
+            "inference_framework": "VLLM_ASCEND",
         },
         modules={
             "block_patterns": ["model.layers.*"],
@@ -132,6 +134,7 @@ def test_full_config_accepts_custom_loader_selectors_candidates_and_costs(
     assert config.runtime.allow_image_text_fallback is True
     assert config.runtime.strict_target_coverage is False
     assert config.runtime.hardware_profile == "a5"
+    assert config.runtime.inference_framework == "vllm_ascend"
     assert config.modules.block_patterns == ("model.layers.*",)
     assert config.candidates.precisions == (
         PrecisionFormat.W4A8,

@@ -18,7 +18,7 @@ schema_version: {CAPABILITY_SCHEMA}
 backend: {{name: vllm_ascend, version: 0.27.1, operator: prolog_v3}}
 hardware: {{profile: {hardware}}}
 domains:
-  - id: prologv3
+  - id: mla_preprocess
     status: verified
     legal_modes: [native, w4a8_mxfp]
     allowed_precisions: [w4a8, w8a8, bf16]

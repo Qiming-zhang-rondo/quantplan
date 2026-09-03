@@ -124,6 +124,7 @@ def build_torch_runtime(config: RunConfig) -> TorchAnalysisRuntime:
         device=_runtime_device_constraint(config.device, bundle.placement is not None),
         compute_kl=config.analysis.compute_kl,
         hardware_profile=config.runtime.hardware_profile,
+        inference_framework=config.runtime.inference_framework,
         capability_snapshot=(
             load_capability_manifest(
                 config.runtime.backend_capability_manifest,

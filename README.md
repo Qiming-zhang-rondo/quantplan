@@ -16,7 +16,7 @@ QuantPlan 是面向模型量化工程师的**证据驱动混合精度规划 P0 �
 | 成本约束搜索与完整组合方案 ΔNLL 复测 | 已实现 |
 | ModelSlim YAML 严格预检、派生 YAML、diff 和 provenance | 已实现 |
 | 对角梯度加权 Risk 与排序评测研究接口 | 已实现；不是默认决策指标 |
-| GLM-5.3 `glm_moe_dsa` 细粒度分组（attention/dense/shared/routed） | 已实现；A3/A5 kernel 兼容性仍需目标框架实测 |
+| GLM-5.3 `glm_moe_dsa` 细粒度分组（MLA preprocessing/attention/dense/shared/routed） | 已实现；A3/A5 kernel 由目标框架插件解析 |
 | Qwen3.5-35B-A3B、GLM-5.3 A3/A5 内网 NPU 实测 | 待目标环境验证 |
 | ModelSlim 权重生成、产物核验和目标硬件 benchmark | 规划中 |
 
@@ -91,7 +91,9 @@ quantplan init quantplan-run.yaml \
 `runtime.backend_capability_manifest: /path/to/prologv3-capability.yaml`。快照中的
 backend version、git commit、硬件 profile、合法 quant mode 和 contract 会写入 provenance；
 升级 vLLM-Ascend/PrologV3 后应重新生成快照并重新分析。没有快照或快照不是 `verified` 时，
-GLM 仍可输出风险证据，但会阻止派生 YAML。
+GLM 仍可输出风险证据，但会阻止派生 YAML。即使快照是 `verified`，它也只声明“可能使用
+这个算子”；还需要框架插件调用真实 resolver，并返回 `runtime_selected=true`，才能证明
+本次配置确实选择了该高速算子。
 
 ### 3. 预检
 
@@ -213,13 +215,20 @@ runtime:
 自动 Block discovery 不适配新架构时，可填写 `modules.block_patterns`。每条 pattern 必须命中，重叠和空匹配都会阻断。`modules.include/exclude` 控制组内量化 target；fused expert 必须同时覆盖 `gate_up_proj` 和 `down_proj`，不能只选一半。
 
 模型结构通过版本化 `ArchitectureAdapter` 插件隔离。Qwen3.5 MoE 与 GLM-5.3
-`glm_moe_dsa` 已有独立适配器；GLM 会把一个 Block 拆成 attention、dense MLP、shared
-expert、routed expert 四类决策域，使 W4A8/W8A8 混配可以表达。`indexer`、`weights_proj`、
+`glm_moe_dsa` 已有独立适配器；GLM 会把一个 Block 拆成中性的 MLA preprocessing、
+attention、dense MLP、shared expert、routed expert 五类决策域，使 W4A8/W8A8 混配可以
+表达。`indexer`、`weights_proj`、
 `compressor`、`kv_b_proj`、`wk`、router 等路径仍保持保护精度。GLM 的分组只回答“可以测量
 哪些域”，不等于 PrologV3 kernel 已命中：官方公开的 GLM-5 W4A8 recipe 目前标注 A2/A3，
 A5 需要内网 capability manifest 或真实框架测试后才能生成可部署 YAML。DeepSeek、Kimi
 仍需按代际提供独立插件。外部包可通过 `quantplan.architecture_adapters` entry point
 接入，未知或歧义 custom/fused op 会阻断。完整合同见 [`docs/architecture-adapters.md`](docs/architecture-adapters.md)。
+
+高速算子选择由独立的 `InferenceFrameworkAdapter` 完成。模型名本身不能推出 PrologV3、
+MLA 或 GDN；插件必须结合推理框架、版本/commit、硬件和 capability snapshot 返回实际
+operator、fallback 链与原因。外部框架插件通过 `quantplan.inference_framework_adapters`
+entry point 接入。完整合同见
+[`docs/inference-framework-adapters.md`](docs/inference-framework-adapters.md)。
 
 ## 输出产物
 

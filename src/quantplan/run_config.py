@@ -40,6 +40,7 @@ class RuntimeConfig:
     allow_image_text_fallback: bool = False
     hardware_profile: str = "unknown"
     backend_capability_manifest: Path | None = None
+    inference_framework: str = "auto"
 
     def __post_init__(self) -> None:
         if not _valid_loader(self.loader):
@@ -81,6 +82,9 @@ class RuntimeConfig:
             self.backend_capability_manifest, Path
         ):
             raise RunConfigError("$.runtime.backend_capability_manifest must be a path or null")
+        if not isinstance(self.inference_framework, str) or not self.inference_framework.strip():
+            raise RunConfigError("$.runtime.inference_framework must be a non-empty string")
+        object.__setattr__(self, "inference_framework", self.inference_framework.strip().lower())
 
 
 @dataclass(frozen=True)
@@ -477,6 +481,7 @@ def parse_run_config(
             "strict_target_coverage",
             "hardware_profile",
             "backend_capability_manifest",
+            "inference_framework",
         },
         "$.runtime",
     )
@@ -508,6 +513,10 @@ def parse_run_config(
                 "$.runtime.backend_capability_manifest",
                 root_dir,
             )
+        ),
+        inference_framework=_string(
+            runtime_doc.get("inference_framework", "auto"),
+            "$.runtime.inference_framework",
         ),
     )
 
@@ -879,6 +888,8 @@ runtime:
   hardware_profile: unknown
   # Optional versioned vLLM-Ascend/PrologV3 capability snapshot.
   backend_capability_manifest: null
+  # auto uses the manifest backend; external plug-ins may provide other frameworks.
+  inference_framework: auto
 
 # Empty block/include selectors defer discovery to the runtime inventory. The
 # conservative excludes remain locked, and unknown target coverage fails closed.

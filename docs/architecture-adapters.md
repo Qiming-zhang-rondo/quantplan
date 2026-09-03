@@ -102,16 +102,17 @@ ModelSlim Qwen3.5 MoE adapter 提交，并声明：
 ### GLM-5.3 `glm_moe_dsa`
 
 GLM-5/5.1/5.2/5.3 共用 `glm_moe_dsa` 这一 Transformers 架构标识。内置适配器按一个
-Block 的实际模块路径拆出四个分析域：
+Block 的实际模块路径拆出五个分析域：
 
 | 分析域 | 典型目标 | 当前处理 |
 | --- | --- | --- |
+| `mla_preprocess` | `q_a/q_b/kv_a/kv_b/q_proj/W_UK` 等 | 模型侧只声明 domain；具体 PrologV3/MLAPO/NATIVE owner 由框架插件决定 |
 | `attention` | `self_attn.*` | 可测量 W4A8/W8A8；`indexer`、`weights_proj`、`kv_b_proj`、`wk` 等保护路径排除 |
 | `dense_mlp` | 非 expert 的 `mlp.*` | 可测量；最终是否落入融合 kernel 由目标后端确认 |
 | `shared_expert` | `mlp.shared_experts.*` | 独立决策域，不与 routed expert 混合 |
 | `routed_expert` | packed `mlp.experts.gate_up_proj/down_proj` | fused 权重按 expert 原子映射；不能拆开 gate/up/down |
 
-这四类是“候选测量边界”，不是静态地宣称所有域都能在 A3/A5 使用 W4A8。公开
+这五类是“候选测量边界”，不是静态地宣称所有域都能在 A3/A5 使用 W4A8。公开
 ModelSlim GLM-5 W4A8 recipe 已验证的目标标签是 A2/A3；A5 没有公开的等价声明。因此
 运行结果会把 PrologV3 的输入/输出格式、融合覆盖和 kernel 命中保留为外部门禁：没有
 capability manifest 或实测报告时，只输出风险排序和候选 plan，不应把结果当成 A5 可部署 YAML。

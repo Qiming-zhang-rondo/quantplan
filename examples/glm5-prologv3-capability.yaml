@@ -9,9 +9,12 @@ backend:
   operator: prolog_v3
 hardware:
   profile: a5
+models:
+  model_types: [glm_moe_dsa]
+  architecture_adapter_ids: []
 
 domains:
-  - id: prologv3
+  - id: mla_preprocess
     status: unknown
     legal_modes: [native, partial_int8, int8, mxfp8]
     allowed_precisions: [w8a8, bf16]
@@ -31,4 +34,3 @@ domains:
       rope: {dtype: bf16}
       cache_index: {dtype: int64}
     fallback: [native, mlapo]
-

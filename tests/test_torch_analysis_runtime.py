@@ -340,6 +340,8 @@ def test_toy_runtime_discovers_fused_experts_excludes_router_and_restores() -> N
     assert result.provenance.placement_strategy == "single_device"
     assert result.provenance.hardware_profile == "unknown"
     assert result.provenance.hardware_capability_status == "unknown_target_capability"
+    assert result.provenance.inference_framework_name == "unknown"
+    assert result.provenance.selected_operator == "unknown"
     assert result.provenance.model_devices == ("cpu",)
     assert result.provenance.target_devices == ("cpu",)
     assert len(result.provenance.placement_sha256) == 64

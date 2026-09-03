@@ -122,23 +122,23 @@ def test_candidate_set_uses_fast_risk_without_inventing_delta_nll() -> None:
 
 def test_domain_allowed_formats_filter_unsupported_w4_candidate() -> None:
     inventory = GroupInventory(
-        "prologv3",
+        "mla_preprocess",
         ("model.layers.0.q_proj",),
         100,
-        quantization_domain="prologv3",
+        quantization_domain="mla_preprocess",
         allowed_formats=(PrecisionFormat.W8A8, PrecisionFormat.BF16),
     )
     result = build_candidate_set(
         (inventory,),
         (
             _measurement(
-                "prologv3",
+                "mla_preprocess",
                 PrecisionFormat.W4A8,
                 2.5,
                 modules=inventory.module_names,
             ),
             _measurement(
-                "prologv3",
+                "mla_preprocess",
                 PrecisionFormat.W8A8,
                 2.1,
                 modules=inventory.module_names,

@@ -42,6 +42,11 @@ from quantplan.runtime.architecture import (
     resolve_architecture_adapter,
 )
 from quantplan.runtime.capability import CapabilitySnapshot
+from quantplan.runtime.framework import (
+    FrameworkAdapterError,
+    FrameworkRequest,
+    resolve_inference_framework,
+)
 
 PROXY_SEMANTICS = (
     "analysis-only symmetric Linear/fused-expert fake-quant proxy; not ModelSlim-exact"
@@ -161,6 +166,15 @@ class RuntimeProvenance:
     fusion_contracts: tuple[str, ...]
     capability_summary: str | None
     capability_manifest_sha256: str | None
+    inference_framework_adapter: str
+    inference_framework_name: str
+    inference_framework_version: str | None
+    selected_operator: str
+    operator_status: str
+    operator_selection_basis: str
+    operator_runtime_selected: bool
+    operator_fallback_modes: tuple[str, ...]
+    operator_resolution_reasons: tuple[str, ...]
     placement_schema: str
     placement_strategy: str
     model_devices: tuple[str, ...]
@@ -203,6 +217,15 @@ class RuntimeProvenance:
             "fusion_contracts": list(self.fusion_contracts),
             "capability_summary": self.capability_summary,
             "capability_manifest_sha256": self.capability_manifest_sha256,
+            "inference_framework_adapter": self.inference_framework_adapter,
+            "inference_framework_name": self.inference_framework_name,
+            "inference_framework_version": self.inference_framework_version,
+            "selected_operator": self.selected_operator,
+            "operator_status": self.operator_status,
+            "operator_selection_basis": self.operator_selection_basis,
+            "operator_runtime_selected": self.operator_runtime_selected,
+            "operator_fallback_modes": list(self.operator_fallback_modes),
+            "operator_resolution_reasons": list(self.operator_resolution_reasons),
             "placement_schema": self.placement_schema,
             "placement_strategy": self.placement_strategy,
             "model_devices": list(self.model_devices),
@@ -677,6 +700,7 @@ class TorchAnalysisRuntime:
         context_id: str | None = None,
         hardware_profile: str = "unknown",
         capability_snapshot: CapabilitySnapshot | None = None,
+        inference_framework: str = "auto",
     ) -> None:
         self._torch = _require_torch()
         if batch_size < 1:
@@ -695,6 +719,20 @@ class TorchAnalysisRuntime:
             self.architecture_adapter = resolve_architecture_adapter(model)
         except ArchitectureAdapterError as exc:
             raise DiscoveryError(f"architecture adapter resolution failed: {exc}") from exc
+        model_config = getattr(model, "config", None)
+        model_type = str(getattr(model_config, "model_type", "unknown") or "unknown").lower()
+        try:
+            self.operator_resolution = resolve_inference_framework(
+                FrameworkRequest(
+                    requested_framework=inference_framework,
+                    architecture_adapter_id=self.architecture_adapter.adapter_id,
+                    model_type=model_type,
+                    hardware_profile=str(hardware_profile).strip().lower(),
+                    capability_snapshot=capability_snapshot,
+                )
+            )
+        except FrameworkAdapterError as exc:
+            raise DiscoveryError(f"inference framework resolution failed: {exc}") from exc
         discovered_groups = _discover_runtime_groups(
             model,
             groups,
@@ -706,7 +744,11 @@ class TorchAnalysisRuntime:
         )
         discovered_groups = _apply_capability_constraints(
             discovered_groups,
-            capability_snapshot,
+            (
+                capability_snapshot
+                if self.operator_resolution.status in {"capability_declared", "verified"}
+                else None
+            ),
         )
         self.discovered_group_count = len(discovered_groups)
         self.all_groups = tuple(group.inventory for group in discovered_groups)
@@ -769,6 +811,16 @@ class TorchAnalysisRuntime:
                 )
             else:
                 self.hardware_capability_status = "capability_verified"
+        if (
+            self.capability_snapshot is not None
+            or inference_framework.strip().lower() != "auto"
+            or self.architecture_adapter.adapter_id.startswith("modelslim.glm_moe_dsa/")
+        ) and not self.operator_resolution.verified:
+            self.backend_compilation_ready = False
+            self.backend_compilation_blockers = (
+                *self.backend_compilation_blockers,
+                "explicit inference framework has no verified operator resolution",
+            )
         self.model_id = model_id
         self.model_revision = model_revision
         self.loader_name = loader_name
@@ -1355,6 +1407,7 @@ class TorchAnalysisRuntime:
             "capability_manifest_sha256": (
                 self.capability_snapshot.sha256 if self.capability_snapshot else None
             ),
+            "operator_resolution": self.operator_resolution.to_dict(),
             "placement": {
                 **placement.placement.to_dict(),
                 "model_devices": list(placement.model_devices),
@@ -1667,6 +1720,15 @@ class TorchAnalysisRuntime:
             capability_manifest_sha256=(
                 self.capability_snapshot.sha256 if self.capability_snapshot else None
             ),
+            inference_framework_adapter=self.operator_resolution.framework_adapter_id,
+            inference_framework_name=self.operator_resolution.framework_name,
+            inference_framework_version=self.operator_resolution.framework_version,
+            selected_operator=self.operator_resolution.operator,
+            operator_status=self.operator_resolution.status,
+            operator_selection_basis=self.operator_resolution.selection_basis,
+            operator_runtime_selected=self.operator_resolution.runtime_selected,
+            operator_fallback_modes=self.operator_resolution.fallback_modes,
+            operator_resolution_reasons=self.operator_resolution.reasons,
             placement_schema=PLACEMENT_SCHEMA,
             placement_strategy=self.placement.strategy,
             model_devices=self.model_devices,
@@ -2143,7 +2205,7 @@ def _apply_capability_constraints(
     constrained: list[_RuntimeGroup] = []
     for group in groups:
         domain_id = group.inventory.quantization_domain
-        if domain_id != "prologv3":
+        if domain_id == "independent":
             constrained.append(group)
             continue
         capability = None
@@ -2152,15 +2214,26 @@ def _apply_capability_constraints(
                 (item for item in snapshot.domains if item.domain_id == domain_id),
                 None,
             )
+            if capability is None:
+                matches = tuple(
+                    item
+                    for item in snapshot.domains
+                    if any(item.matches_owner(owner) for owner in group.inventory.module_names)
+                )
+                if len(matches) > 1:
+                    raise DiscoveryError(
+                        f"quantization domain {domain_id!r} matches multiple backend domains"
+                    )
+                capability = matches[0] if matches else None
         if capability is None or capability.status == "unknown":
             allowed = (PrecisionFormat.BF16,)
             warning = (
-                "prologv3 capability is unknown; independent quantization is disabled "
+                f"{domain_id} capability is unknown; independent quantization is disabled "
                 "and the domain is fixed to BF16"
             )
         else:
             allowed = capability.allowed_precisions or (PrecisionFormat.BF16,)
-            warning = f"prologv3 capability={capability.domain_id}:{capability.status}"
+            warning = f"domain capability={capability.domain_id}:{capability.status}"
         constrained.append(
             replace(
                 group,
@@ -2199,7 +2272,7 @@ def _maybe_split_decision_groups(
         root = group.block_module_names[0]
         categories: dict[str, tuple[list[str], list[_ExpertTarget]]] = {
             "attention": ([], []),
-            "prologv3": ([], []),
+            "mla_preprocess": ([], []),
             "dense_mlp": ([], []),
             "shared_expert": ([], []),
             "routed_expert": ([], []),
@@ -2219,7 +2292,7 @@ def _maybe_split_decision_groups(
                     ".w_uk",
                 )
             ):
-                category = "prologv3"
+                category = "mla_preprocess"
             elif ".self_attn." in name:
                 category = "attention"
             elif ".mlp.shared_experts." in name:
@@ -2264,7 +2337,9 @@ def _maybe_split_decision_groups(
                             *(target.backend_pattern for target in experts),
                         ),
                         quantization_domain=(
-                            "prologv3" if category == "prologv3" else "independent"
+                            "mla_preprocess"
+                            if category == "mla_preprocess"
+                            else "independent"
                         ),
                     ),
                     block_module_names=(root,),

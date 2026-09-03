@@ -53,6 +53,8 @@ class CapabilitySnapshot:
     backend_git_commit: str | None
     operator: str
     hardware_profile: str
+    model_types: tuple[str, ...]
+    architecture_adapter_ids: tuple[str, ...]
     domains: tuple[QuantizationDomainCapability, ...]
     source: str
     sha256: str
@@ -76,6 +78,14 @@ class CapabilitySnapshot:
                 f"{[domain.domain_id for domain in matches]}"
             )
         return matches[0] if matches else None
+
+    def matches_model(self, model_type: str, architecture_adapter_id: str) -> bool:
+        return (
+            not self.model_types or model_type.lower() in self.model_types
+        ) and (
+            not self.architecture_adapter_ids
+            or architecture_adapter_id in self.architecture_adapter_ids
+        )
 
 
 def load_capability_manifest(
@@ -115,6 +125,16 @@ def load_capability_manifest(
             f"capability hardware profile {manifest_hardware!r} does not match "
             f"requested {requested_hardware!r}"
         )
+    models = document.get("models", {})
+    if not isinstance(models, Mapping):
+        raise CapabilityManifestError("models must be a mapping")
+    model_types = tuple(
+        item.lower() for item in _strings(models.get("model_types", ()), "models.model_types")
+    )
+    architecture_adapter_ids = _strings(
+        models.get("architecture_adapter_ids", ()),
+        "models.architecture_adapter_ids",
+    )
     domains_doc = document.get("domains")
     if not isinstance(domains_doc, Sequence) or isinstance(domains_doc, (str, bytes)):
         raise CapabilityManifestError("domains must be a sequence")
@@ -172,6 +192,8 @@ def load_capability_manifest(
         backend_git_commit=commit,
         operator=operator,
         hardware_profile=manifest_hardware,
+        model_types=model_types,
+        architecture_adapter_ids=architecture_adapter_ids,
         domains=tuple(domains),
         source=str(source_path.resolve()),
         sha256=hashlib.sha256(raw).hexdigest(),
