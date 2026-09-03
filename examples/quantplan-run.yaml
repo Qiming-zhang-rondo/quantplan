@@ -19,6 +19,8 @@ runtime:
   strict_target_coverage: true
   # GLM-5.3 target binding: unknown, a3 or a5.
   hardware_profile: unknown
+  # Optional versioned vLLM-Ascend/PrologV3 capability snapshot.
+  backend_capability_manifest: null
 
 # Empty block/include selectors defer discovery to the runtime inventory. The
 # conservative excludes remain locked, and unknown target coverage fails closed.

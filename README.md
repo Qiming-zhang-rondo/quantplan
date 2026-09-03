@@ -87,6 +87,12 @@ quantplan init quantplan-run.yaml \
 上下文绑定的分析结果；默认 `unknown`。该字段只绑定目标，不会把公开 recipe 或代理测量
 自动升级为 PrologV3 kernel 支持。
 
+如果目标后端提供了版本化能力快照，可同时设置
+`runtime.backend_capability_manifest: /path/to/prologv3-capability.yaml`。快照中的
+backend version、git commit、硬件 profile、合法 quant mode 和 contract 会写入 provenance；
+升级 vLLM-Ascend/PrologV3 后应重新生成快照并重新分析。没有快照或快照不是 `verified` 时，
+GLM 仍可输出风险证据，但会阻止派生 YAML。
+
 ### 3. 预检
 
 ```bash

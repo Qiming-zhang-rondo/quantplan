@@ -47,6 +47,12 @@ loaded model
 | runtime target 到后端映射 | `map_fused_target(...) -> FusedTargetMapping | None` | `runtime_parameter_names`、`backend_module_names`、`backend_pattern` 和 `activation_kwarg` 必须完整且可审计 |
 | 能力状态 | runtime 输出的 `backend_adapter`、`backend_compilation_ready`、`backend_compilation_blockers` | `ready` 只表示后端 target 映射完整，不代表 ModelSlim 可执行、精度合格或硬件已验证 |
 
+后端能力不是适配器常量。`quantplan.runtime.capability` 读取版本化 capability snapshot，
+绑定 backend version/git commit、硬件 profile、quant mode 和 domain contract。模型适配器
+只声明 owner 到 domain 的归属；能力快照决定该 domain 当下允许哪些精度组合。后端升级后
+应重新生成快照并重新分析；快照缺失、版本不匹配或状态不是 `verified` 时，GLM 仍可做
+风险排序，但 YAML 编译必须阻断。
+
 注册、枚举和解析使用：
 
 - `register_architecture_adapter`；

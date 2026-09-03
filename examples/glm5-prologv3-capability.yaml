@@ -1,0 +1,34 @@
+schema_version: quantplan.capability/v1
+
+# This is a versioned snapshot, not a promise that every future backend keeps
+# the same contract. Regenerate it after upgrading vLLM-Ascend/PrologV3.
+backend:
+  name: vllm_ascend
+  version: REPLACE_WITH_VLLM_ASCEND_VERSION
+  git_commit: REPLACE_WITH_GIT_COMMIT
+  operator: prolog_v3
+hardware:
+  profile: a5
+
+domains:
+  - id: prologv3
+    status: unknown
+    legal_modes: [native, partial_int8, int8, mxfp8]
+    allowed_precisions: [w8a8, bf16]
+    owners:
+      - "*fused_qkv_a_proj*"
+      - "*q_a*"
+      - "*q_b*"
+      - "*kv_a*"
+      - "*kv_b*"
+      - "*q_proj*"
+      - "*weight_uk*"
+    contract:
+      weight_dq: {dtype: int8, layout: FRACTAL_NZ}
+      weight_uq_qr: {dtype: int8, layout: FRACTAL_NZ}
+      weight_dkv_kr: {dtype: int8, layout: FRACTAL_NZ}
+      weight_uk: {dtype: bf16, layout: ND}
+      rope: {dtype: bf16}
+      cache_index: {dtype: int64}
+    fallback: [native, mlapo]
+

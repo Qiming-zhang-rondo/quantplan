@@ -122,6 +122,11 @@ def build_candidate_set(
             raise ValueError(f"module inventory drift for group {item.group_id!r}")
         if item.parameter_count != inventory.parameter_count:
             raise ValueError(f"parameter count drift for group {item.group_id!r}")
+        if (
+            inventory.allowed_formats is not None
+            and item.precision not in inventory.allowed_formats
+        ):
+            continue
         if item.precision not in formats:
             raise ValueError(
                 f"measurement precision {item.precision.value!r} is not allowed"
@@ -161,15 +166,22 @@ def build_candidate_set(
             group_id=inventory.group_id,
             module_names=inventory.module_names,
             kind=inventory.kind,
-            allowed_formats=formats,
+            allowed_formats=_inventory_formats(inventory, formats),
         )
         for inventory in inventories
     )
+    groups_by_id = {group.group_id: group for group in groups}
     for inventory in inventories:
-        if (inventory.group_id, policy.base_precision) not in by_key:
+        group = groups_by_id[inventory.group_id]
+        base_precision = (
+            policy.base_precision
+            if policy.base_precision in group.allowed_formats
+            else _cheapest_allowed_format(group, relative_costs)
+        )
+        if (inventory.group_id, base_precision) not in by_key:
             raise ValueError(
                 f"missing base measurement for {inventory.group_id}/"
-                f"{policy.base_precision.value}"
+                f"{base_precision.value}"
             )
         if (inventory.group_id, PrecisionFormat.BF16) not in by_key:
             evidence.append(
@@ -206,8 +218,17 @@ def build_candidate_set(
     )
 
     base_cost = sum(
-        inventory.parameter_count * float(relative_costs[policy.base_precision])
-        for inventory in inventories
+        inventory.parameter_count
+        * float(
+            relative_costs[
+                (
+                    policy.base_precision
+                    if group.allowed_formats and policy.base_precision in group.allowed_formats
+                    else _cheapest_allowed_format(group, relative_costs)
+                )
+            ]
+        )
+        for inventory, group in zip(inventories, groups, strict=True)
     )
     ceiling_cost = sum(
         inventory.parameter_count
@@ -297,6 +318,30 @@ def _index_inventory(
             raise ValueError(f"duplicate group inventory {item.group_id!r}")
         indexed[item.group_id] = item
     return indexed
+
+
+def _inventory_formats(
+    inventory: GroupInventory,
+    formats: Sequence[PrecisionFormat],
+) -> tuple[PrecisionFormat, ...]:
+    allowed = tuple(
+        precision
+        for precision in formats
+        if inventory.allowed_formats is None or precision in inventory.allowed_formats
+    )
+    if PrecisionFormat.BF16 not in allowed:
+        allowed += (PrecisionFormat.BF16,)
+    return allowed
+
+
+def _cheapest_allowed_format(
+    group: DecisionGroup,
+    relative_costs: Mapping[PrecisionFormat, float],
+) -> PrecisionFormat:
+    return min(
+        group.allowed_formats,
+        key=lambda precision: (float(relative_costs[precision]), precision.value),
+    )
 
 
 def _validate_costs(

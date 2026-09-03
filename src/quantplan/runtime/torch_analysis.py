@@ -41,6 +41,7 @@ from quantplan.runtime.architecture import (
     ArchitectureAdapterError,
     resolve_architecture_adapter,
 )
+from quantplan.runtime.capability import CapabilitySnapshot
 
 PROXY_SEMANTICS = (
     "analysis-only symmetric Linear/fused-expert fake-quant proxy; not ModelSlim-exact"
@@ -158,6 +159,8 @@ class RuntimeProvenance:
     hardware_profile: str
     hardware_capability_status: str
     fusion_contracts: tuple[str, ...]
+    capability_summary: str | None
+    capability_manifest_sha256: str | None
     placement_schema: str
     placement_strategy: str
     model_devices: tuple[str, ...]
@@ -198,6 +201,8 @@ class RuntimeProvenance:
             "hardware_profile": self.hardware_profile,
             "hardware_capability_status": self.hardware_capability_status,
             "fusion_contracts": list(self.fusion_contracts),
+            "capability_summary": self.capability_summary,
+            "capability_manifest_sha256": self.capability_manifest_sha256,
             "placement_schema": self.placement_schema,
             "placement_strategy": self.placement_strategy,
             "model_devices": list(self.model_devices),
@@ -671,6 +676,7 @@ class TorchAnalysisRuntime:
         placement: ModelPlacement | None = None,
         context_id: str | None = None,
         hardware_profile: str = "unknown",
+        capability_snapshot: CapabilitySnapshot | None = None,
     ) -> None:
         self._torch = _require_torch()
         if batch_size < 1:
@@ -697,6 +703,10 @@ class TorchAnalysisRuntime:
             max_groups=None,
             strict_targets=strict_targets,
             architecture_adapter=self.architecture_adapter,
+        )
+        discovered_groups = _apply_capability_constraints(
+            discovered_groups,
+            capability_snapshot,
         )
         self.discovered_group_count = len(discovered_groups)
         self.all_groups = tuple(group.inventory for group in discovered_groups)
@@ -725,6 +735,13 @@ class TorchAnalysisRuntime:
                 "hardware_profile must be one of unknown, a3 or a5"
             )
         self.hardware_profile = normalized_hardware_profile
+        if capability_snapshot is not None and (
+            capability_snapshot.hardware_profile not in {"unknown", self.hardware_profile}
+        ):
+            raise ValueError(
+                "capability snapshot hardware profile does not match runtime hardware_profile"
+            )
+        self.capability_snapshot = capability_snapshot
         recipe_hardware = tuple(
             str(item).strip().lower()
             for item in getattr(self.architecture_adapter, "recipe_verified_hardware", ())
@@ -737,6 +754,21 @@ class TorchAnalysisRuntime:
         self.fusion_contracts = tuple(
             str(item) for item in getattr(self.architecture_adapter, "fusion_contracts", ())
         )
+        if self.architecture_adapter.adapter_id.startswith("modelslim.glm_moe_dsa/"):
+            if self.capability_snapshot is None:
+                self.hardware_capability_status = "unknown_capability_manifest"
+                self.backend_compilation_ready = False
+                self.backend_compilation_blockers = (
+                    "GLM PrologV3 capability manifest is required before YAML compilation",
+                )
+            elif not self.capability_snapshot.known:
+                self.hardware_capability_status = "unknown_capability_manifest"
+                self.backend_compilation_ready = False
+                self.backend_compilation_blockers = (
+                    f"capability snapshot {self.capability_snapshot.summary} is not verified",
+                )
+            else:
+                self.hardware_capability_status = "capability_verified"
         self.model_id = model_id
         self.model_revision = model_revision
         self.loader_name = loader_name
@@ -1317,6 +1349,12 @@ class TorchAnalysisRuntime:
             "hardware_profile": self.hardware_profile,
             "hardware_capability_status": self.hardware_capability_status,
             "fusion_contracts": list(self.fusion_contracts),
+            "capability_summary": (
+                self.capability_snapshot.summary if self.capability_snapshot else None
+            ),
+            "capability_manifest_sha256": (
+                self.capability_snapshot.sha256 if self.capability_snapshot else None
+            ),
             "placement": {
                 **placement.placement.to_dict(),
                 "model_devices": list(placement.model_devices),
@@ -1623,6 +1661,12 @@ class TorchAnalysisRuntime:
             hardware_profile=self.hardware_profile,
             hardware_capability_status=self.hardware_capability_status,
             fusion_contracts=self.fusion_contracts,
+            capability_summary=(
+                self.capability_snapshot.summary if self.capability_snapshot else None
+            ),
+            capability_manifest_sha256=(
+                self.capability_snapshot.sha256 if self.capability_snapshot else None
+            ),
             placement_schema=PLACEMENT_SCHEMA,
             placement_strategy=self.placement.strategy,
             model_devices=self.model_devices,
@@ -2090,6 +2134,46 @@ def _kl_sum(torch: Any, reference_logits: Any, candidate_logits: Any, mask: Any)
     return float(token_kl.masked_select(valid).sum().item())
 
 
+def _apply_capability_constraints(
+    groups: Sequence[_RuntimeGroup],
+    snapshot: CapabilitySnapshot | None,
+) -> tuple[_RuntimeGroup, ...]:
+    """Bind domain candidates to the backend snapshot, failing closed."""
+
+    constrained: list[_RuntimeGroup] = []
+    for group in groups:
+        domain_id = group.inventory.quantization_domain
+        if domain_id != "prologv3":
+            constrained.append(group)
+            continue
+        capability = None
+        if snapshot is not None:
+            capability = next(
+                (item for item in snapshot.domains if item.domain_id == domain_id),
+                None,
+            )
+        if capability is None or capability.status == "unknown":
+            allowed = (PrecisionFormat.BF16,)
+            warning = (
+                "prologv3 capability is unknown; independent quantization is disabled "
+                "and the domain is fixed to BF16"
+            )
+        else:
+            allowed = capability.allowed_precisions or (PrecisionFormat.BF16,)
+            warning = f"prologv3 capability={capability.domain_id}:{capability.status}"
+        constrained.append(
+            replace(
+                group,
+                inventory=replace(
+                    group.inventory,
+                    allowed_formats=allowed,
+                    warnings=(*group.inventory.warnings, warning),
+                ),
+            )
+        )
+    return tuple(constrained)
+
+
 def _maybe_split_decision_groups(
     torch: Any,
     modules: Mapping[str, Any],
@@ -2115,12 +2199,28 @@ def _maybe_split_decision_groups(
         root = group.block_module_names[0]
         categories: dict[str, tuple[list[str], list[_ExpertTarget]]] = {
             "attention": ([], []),
+            "prologv3": ([], []),
             "dense_mlp": ([], []),
             "shared_expert": ([], []),
             "routed_expert": ([], []),
         }
         for name in group.linear_module_names:
-            if ".self_attn." in name:
+            lowered = name.lower()
+            if any(
+                token in lowered
+                for token in (
+                    "fused_qkv_a_proj",
+                    ".q_a",
+                    ".q_b",
+                    ".kv_a",
+                    ".kv_b",
+                    ".q_proj",
+                    "weight_uk",
+                    ".w_uk",
+                )
+            ):
+                category = "prologv3"
+            elif ".self_attn." in name:
                 category = "attention"
             elif ".mlp.shared_experts." in name:
                 category = "shared_expert"
@@ -2162,6 +2262,9 @@ def _maybe_split_decision_groups(
                         backend_patterns=(
                             *linears,
                             *(target.backend_pattern for target in experts),
+                        ),
+                        quantization_domain=(
+                            "prologv3" if category == "prologv3" else "independent"
                         ),
                     ),
                     block_module_names=(root,),
@@ -2444,6 +2547,12 @@ def _group_inventory_to_dict(group: GroupInventory) -> dict[str, Any]:
         "kind": group.kind,
         "warnings": list(group.warnings),
         "backend_patterns": list(group.effective_backend_patterns),
+        "quantization_domain": group.quantization_domain,
+        "allowed_formats": (
+            None
+            if group.allowed_formats is None
+            else [precision.value for precision in group.allowed_formats]
+        ),
     }
 
 

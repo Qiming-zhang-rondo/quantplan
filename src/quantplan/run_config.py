@@ -39,6 +39,7 @@ class RuntimeConfig:
     strict_target_coverage: bool = True
     allow_image_text_fallback: bool = False
     hardware_profile: str = "unknown"
+    backend_capability_manifest: Path | None = None
 
     def __post_init__(self) -> None:
         if not _valid_loader(self.loader):
@@ -76,6 +77,10 @@ class RuntimeConfig:
                 "$.runtime.hardware_profile must be one of unknown, a3 or a5"
             )
         object.__setattr__(self, "hardware_profile", self.hardware_profile.strip().lower())
+        if self.backend_capability_manifest is not None and not isinstance(
+            self.backend_capability_manifest, Path
+        ):
+            raise RunConfigError("$.runtime.backend_capability_manifest must be a path or null")
 
 
 @dataclass(frozen=True)
@@ -322,6 +327,10 @@ class RunConfig:
             "original_yaml": str(self.original_yaml),
             "output_dir": str(self.output_dir),
             "device": self.device,
+            "backend_capability_manifest": (
+                "" if self.runtime.backend_capability_manifest is None
+                else str(self.runtime.backend_capability_manifest)
+            ),
         }
         return tuple(
             name for name, value in fields.items() if _PLACEHOLDER_MARKER in value
@@ -358,6 +367,11 @@ class RunConfig:
             path = getattr(self, name)
             if not path.exists():
                 raise RunConfigError(f"$.{name} does not exist: {path}")
+        if self.runtime.backend_capability_manifest is not None and not self.runtime.backend_capability_manifest.is_file():
+            raise RunConfigError(
+                "$.runtime.backend_capability_manifest is not a file: "
+                f"{self.runtime.backend_capability_manifest}"
+            )
         if not self.original_yaml.is_file():
             raise RunConfigError(f"$.original_yaml is not a file: {self.original_yaml}")
         if self.output_dir.exists() and not self.output_dir.is_dir():
@@ -462,6 +476,7 @@ def parse_run_config(
             "allow_image_text_fallback",
             "strict_target_coverage",
             "hardware_profile",
+            "backend_capability_manifest",
         },
         "$.runtime",
     )
@@ -484,6 +499,15 @@ def parse_run_config(
         hardware_profile=_string(
             runtime_doc.get("hardware_profile", "unknown"),
             "$.runtime.hardware_profile",
+        ),
+        backend_capability_manifest=(
+            None
+            if runtime_doc.get("backend_capability_manifest") is None
+            else _input_path(
+                runtime_doc["backend_capability_manifest"],
+                "$.runtime.backend_capability_manifest",
+                root_dir,
+            )
         ),
     )
 
@@ -853,6 +877,8 @@ runtime:
   strict_target_coverage: true
   # GLM-5.3 target binding: unknown, a3 or a5.
   hardware_profile: unknown
+  # Optional versioned vLLM-Ascend/PrologV3 capability snapshot.
+  backend_capability_manifest: null
 
 # Empty block/include selectors defer discovery to the runtime inventory. The
 # conservative excludes remain locked, and unknown target coverage fails closed.

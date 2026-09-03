@@ -9,6 +9,7 @@ from quantplan.adapters.modelslim import (
     profile_linear_source,
 )
 from quantplan.run_config import RunConfig
+from quantplan.runtime.capability import load_capability_manifest
 from quantplan.runtime.torch_analysis import (
     TorchAnalysisRuntime,
     discover_transformer_blocks,
@@ -123,6 +124,14 @@ def build_torch_runtime(config: RunConfig) -> TorchAnalysisRuntime:
         device=_runtime_device_constraint(config.device, bundle.placement is not None),
         compute_kl=config.analysis.compute_kl,
         hardware_profile=config.runtime.hardware_profile,
+        capability_snapshot=(
+            load_capability_manifest(
+                config.runtime.backend_capability_manifest,
+                hardware_profile=config.runtime.hardware_profile,
+            )
+            if config.runtime.backend_capability_manifest is not None
+            else None
+        ),
     )
     discovered_targets = {
         module_name

@@ -26,6 +26,13 @@ from quantplan.runtime.architecture import (
     resolve_architecture_adapter,
     unregister_architecture_adapter,
 )
+from quantplan.runtime.capability import (
+    CAPABILITY_SCHEMA,
+    CapabilityManifestError,
+    CapabilitySnapshot,
+    QuantizationDomainCapability,
+    load_capability_manifest,
+)
 from quantplan.runtime.factory import (
     build_torch_runtime,
     expand_block_patterns,
@@ -57,6 +64,7 @@ from quantplan.runtime.torch_analysis import (
 
 __all__ = [
     "ARCHITECTURE_ADAPTER_ENTRY_POINT",
+    "CAPABILITY_SCHEMA",
     "DEFAULT_LINEAR_EXCLUDE",
     "GENERIC_ADAPTER_ID",
     "GLM5_FUSION_CONTRACTS",
@@ -74,6 +82,8 @@ __all__ = [
     "ArchitectureAdapterRegistry",
     "ArchitectureAdapterResolutionError",
     "ArchitectureTargetMappingError",
+    "CapabilityManifestError",
+    "CapabilitySnapshot",
     "DiscoveryError",
     "FusedTargetMapping",
     "GenericLinearAdapter",
@@ -84,6 +94,7 @@ __all__ = [
     "ModelPlacement",
     "PlanEvaluation",
     "ProgressCallback",
+    "QuantizationDomainCapability",
     "Qwen35MoeModelSlimAdapter",
     "RuntimeProvenance",
     "TextSample",
@@ -95,6 +106,7 @@ __all__ = [
     "discover_transformer_blocks",
     "expand_block_patterns",
     "intervention_measurement_to_dict",
+    "load_capability_manifest",
     "load_causal_lm",
     "load_jsonl_texts",
     "plan_evaluation_to_dict",

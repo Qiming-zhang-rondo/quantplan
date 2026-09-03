@@ -424,7 +424,8 @@ def test_glm_runtime_splits_blocks_into_fusion_aware_decision_groups() -> None:
 
     assert runtime.backend_adapter == GLM5_MOE_DSA_ADAPTER_ID
     assert runtime.hardware_profile == "a3"
-    assert runtime.hardware_capability_status == "recipe_verified_only"
+    assert runtime.hardware_capability_status == "unknown_capability_manifest"
+    assert runtime.backend_compilation_ready is False
     assert runtime.full_group_coverage is True
     assert {group.kind.rsplit(".", 1)[-1] for group in runtime.groups} >= {
         "dense_mlp",

@@ -96,6 +96,8 @@ class GroupInventory:
     kind: str = "transformer_block"
     warnings: tuple[str, ...] = ()
     backend_patterns: tuple[str, ...] = ()
+    quantization_domain: str = "independent"
+    allowed_formats: tuple[PrecisionFormat, ...] | None = None
 
     def __post_init__(self) -> None:
         if not self.group_id:
@@ -111,6 +113,15 @@ class GroupInventory:
             raise ValueError(
                 "backend_patterns must be empty or align one-to-one with module_names"
             )
+        if not self.quantization_domain:
+            raise ValueError("quantization_domain must not be empty")
+        if self.allowed_formats is not None:
+            if not self.allowed_formats:
+                raise ValueError("allowed_formats must not be empty when provided")
+            if any(not isinstance(item, PrecisionFormat) for item in self.allowed_formats):
+                raise ValueError("allowed_formats must contain PrecisionFormat values")
+            if len(set(self.allowed_formats)) != len(self.allowed_formats):
+                raise ValueError("allowed_formats must not contain duplicates")
 
     @property
     def effective_backend_patterns(self) -> tuple[str, ...]:

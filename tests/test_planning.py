@@ -120,6 +120,41 @@ def test_candidate_set_uses_fast_risk_without_inventing_delta_nll() -> None:
     assert not hasattr(measurement, "delta_nll")
 
 
+def test_domain_allowed_formats_filter_unsupported_w4_candidate() -> None:
+    inventory = GroupInventory(
+        "prologv3",
+        ("model.layers.0.q_proj",),
+        100,
+        quantization_domain="prologv3",
+        allowed_formats=(PrecisionFormat.W8A8, PrecisionFormat.BF16),
+    )
+    result = build_candidate_set(
+        (inventory,),
+        (
+            _measurement(
+                "prologv3",
+                PrecisionFormat.W4A8,
+                2.5,
+                modules=inventory.module_names,
+            ),
+            _measurement(
+                "prologv3",
+                PrecisionFormat.W8A8,
+                2.1,
+                modules=inventory.module_names,
+            ),
+        ),
+        allowed_formats=(PrecisionFormat.W4A8, PrecisionFormat.W8A8),
+    )
+
+    assert all(item.precision is not PrecisionFormat.W4A8 for item in result.evidence)
+    assert all(
+        assignment is not PrecisionFormat.W4A8
+        for plan in result.plans
+        for assignment in plan.assignments.values()
+    )
+
+
 def test_choose_lowest_cost_plan_uses_whole_plan_validation() -> None:
     inventory = GroupInventory("block_0", ("layers.0.fc",), 100)
     result = build_candidate_set(
