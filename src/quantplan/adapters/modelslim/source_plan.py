@@ -50,8 +50,15 @@ class TemplateResolution:
 def profile_linear_source(
     source: str | Path,
     candidate_module_names: Iterable[str],
+    candidate_aliases: Mapping[str, Iterable[str]] | None = None,
 ) -> LinearSourceProfile:
-    """Resolve source linear targets against a typed proxy target inventory."""
+    """Resolve source linear targets against a typed proxy target inventory.
+
+    ``candidate_aliases`` bridges a packed runtime target (for example GLM's
+    ``mlp.experts`` tensor) to the expanded backend names used by a ModelSlim
+    pattern such as ``*mlp.experts.*``.  The returned profile always contains
+    canonical runtime names, never synthetic aliases.
+    """
 
     source_path = Path(source)
     source_bytes = source_path.read_bytes()
@@ -74,6 +81,11 @@ def profile_linear_source(
         raise SourcePlanError("candidate module inventory must contain non-empty names")
     if len(set(candidates)) != len(candidates):
         raise SourcePlanError("candidate module inventory contains duplicates")
+    aliases = {
+        name: tuple(dict.fromkeys(str(alias) for alias in values))
+        for name, values in (candidate_aliases or {}).items()
+        if name in candidates
+    }
 
     covered: set[str] = set()
     templates: dict[PrecisionFormat, dict[str, Any]] = {}
@@ -92,8 +104,16 @@ def profile_linear_source(
         matched = {
             name
             for name in candidates
-            if any(fnmatchcase(name, pattern) for pattern in include)
-            and not any(fnmatchcase(name, pattern) for pattern in exclude)
+            if any(
+                fnmatchcase(alias, pattern)
+                for alias in (name, *aliases.get(name, ()))
+                for pattern in include
+            )
+            and not any(
+                fnmatchcase(alias, pattern)
+                for alias in (name, *aliases.get(name, ()))
+                for pattern in exclude
+            )
         }
         covered.update(matched)
 

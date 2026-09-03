@@ -12,11 +12,12 @@ QuantPlan 是面向模型量化工程师的**证据驱动混合精度规划 P0 �
 | --- | --- |
 | `quantplan init / doctor / run` 一键工作流 | 已实现 |
 | 整模型 teacher-forced 单组 W4A8/W8A8 fake-quant 前向 | 已实现；分析代理，不是 ModelSlim-exact |
-| 普通 `nn.Linear` 和 Qwen 风格三维 fused MoE experts | 已实现；fused 权重完整，A8 仅覆盖模块入口，router 默认排除 |
+| 普通 `nn.Linear`、Qwen3.5 和 GLM-5.3（三维 fused MoE） | 已实现结构发现与分析代理；fused 权重完整，A8 仅覆盖模块入口，router/DSA 索引路径默认排除 |
 | 成本约束搜索与完整组合方案 ΔNLL 复测 | 已实现 |
 | ModelSlim YAML 严格预检、派生 YAML、diff 和 provenance | 已实现 |
 | 对角梯度加权 Risk 与排序评测研究接口 | 已实现；不是默认决策指标 |
-| Qwen3.5-35B-A3B 内网 NPU 实测 | 待目标环境验证 |
+| GLM-5.3 `glm_moe_dsa` 细粒度分组（attention/dense/shared/routed） | 已实现；A3/A5 kernel 兼容性仍需目标框架实测 |
+| Qwen3.5-35B-A3B、GLM-5.3 A3/A5 内网 NPU 实测 | 待目标环境验证 |
 | ModelSlim 权重生成、产物核验和目标硬件 benchmark | 规划中 |
 
 静态 YAML 预检通过不代表后端可执行。所有派生结果都保留 `execution_readiness: not_assessed`，直到锁定版本的 ModelSlim、CANN、推理引擎和目标硬件完成验证。
@@ -81,6 +82,10 @@ quantplan init quantplan-run.yaml \
 对 35B 模型，`npu:0` 表示整模单卡加载，只有模型与 fake-quant 临时空间都能放入该卡时才应使用。`npu:auto` 会请求 Hugging Face/Accelerate 的 `device_map="auto"` 并先确认 NPU runtime 可用；加载后 QuantPlan 还会核对实际参数与候选 target 的 placement。CPU/disk/meta offload和已检测到的多进程 distributed 执行会阻断。合同同时禁止 TP/FSDP/EP 和单进程参数切片，但任意自定义实现无法只靠通用反射完全识别，custom loader 必须如实声明。
 
 不提供参数时，`quantplan init` 会生成带 `REPLACE_WITH_*` 占位符的模板；`doctor` 和 `run` 都会阻断未填写的模板。完整配置示例见 `examples/quantplan-run.yaml`。
+
+针对 GLM-5.3 可在配置中显式设置 `runtime.hardware_profile: a3` 或 `a5`，分别保存两套
+上下文绑定的分析结果；默认 `unknown`。该字段只绑定目标，不会把公开 recipe 或代理测量
+自动升级为 PrologV3 kernel 支持。
 
 ### 3. 预检
 
@@ -201,7 +206,14 @@ runtime:
 
 自动 Block discovery 不适配新架构时，可填写 `modules.block_patterns`。每条 pattern 必须命中，重叠和空匹配都会阻断。`modules.include/exclude` 控制组内量化 target；fused expert 必须同时覆盖 `gate_up_proj` 和 `down_proj`，不能只选一半。
 
-模型结构通过版本化 `ArchitectureAdapter` 插件隔离。Qwen3.5 MoE 是首个已审计映射；GLM、DeepSeek、Kimi 必须按代际分别提供 Block 发现、安全锁定和后端 target 映射插件，当前不能据此宣称已支持。外部包可通过 `quantplan.architecture_adapters` entry point 接入，未知或歧义 custom/fused op 会阻断。完整合同见 [`docs/architecture-adapters.md`](docs/architecture-adapters.md)。
+模型结构通过版本化 `ArchitectureAdapter` 插件隔离。Qwen3.5 MoE 与 GLM-5.3
+`glm_moe_dsa` 已有独立适配器；GLM 会把一个 Block 拆成 attention、dense MLP、shared
+expert、routed expert 四类决策域，使 W4A8/W8A8 混配可以表达。`indexer`、`weights_proj`、
+`compressor`、`kv_b_proj`、`wk`、router 等路径仍保持保护精度。GLM 的分组只回答“可以测量
+哪些域”，不等于 PrologV3 kernel 已命中：官方公开的 GLM-5 W4A8 recipe 目前标注 A2/A3，
+A5 需要内网 capability manifest 或真实框架测试后才能生成可部署 YAML。DeepSeek、Kimi
+仍需按代际提供独立插件。外部包可通过 `quantplan.architecture_adapters` entry point
+接入，未知或歧义 custom/fused op 会阻断。完整合同见 [`docs/architecture-adapters.md`](docs/architecture-adapters.md)。
 
 ## 输出产物
 

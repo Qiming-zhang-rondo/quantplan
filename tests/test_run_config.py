@@ -43,6 +43,7 @@ def test_minimal_config_has_conservative_defaults_and_anchors_paths(tmp_path: Pa
     assert config.runtime.trust_remote_code is False
     assert config.runtime.allow_image_text_fallback is False
     assert config.runtime.strict_target_coverage is True
+    assert config.runtime.hardware_profile == "unknown"
     assert config.modules.block_patterns == ()
     assert config.modules.include == ()
     assert config.modules.exclude == (
@@ -85,6 +86,7 @@ def test_full_config_accepts_custom_loader_selectors_candidates_and_costs(
             "trust_remote_code": True,
             "allow_image_text_fallback": True,
             "strict_target_coverage": False,
+            "hardware_profile": "A5",
         },
         modules={
             "block_patterns": ["model.layers.*"],
@@ -129,6 +131,7 @@ def test_full_config_accepts_custom_loader_selectors_candidates_and_costs(
     assert config.runtime.torch_dtype == "auto"
     assert config.runtime.allow_image_text_fallback is True
     assert config.runtime.strict_target_coverage is False
+    assert config.runtime.hardware_profile == "a5"
     assert config.modules.block_patterns == ("model.layers.*",)
     assert config.candidates.precisions == (
         PrecisionFormat.W4A8,
@@ -213,6 +216,18 @@ device: npu:0
 runtime: {torch_dtype: float16}
 """,
             "cannot be labeled BF16",
+        ),
+        (
+            """\
+schema_version: quantplan_v1
+model_path: a
+data_path: b
+original_yaml: c
+output_dir: d
+device: npu:0
+runtime: {hardware_profile: a2}
+""",
+            "one of unknown, a3 or a5",
         ),
         (
             """\

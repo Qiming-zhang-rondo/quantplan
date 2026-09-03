@@ -1,8 +1,8 @@
 # Architecture Adapter：模型家族边界与插件合同
 
-> 本文描述模型架构插件边界，不代表某个模型已经完成量化或硬件验证。当前只有
-> Qwen3.5 MoE 的一段 ModelSlim 后端映射经过源码审计；GLM、DeepSeek、Kimi 尚未接入，
-> 也不应被表述为“已支持”。
+> 本文描述模型架构插件边界，不代表某个模型已经完成量化或硬件验证。当前 Qwen3.5 MoE
+> 和 GLM-5.3 `glm_moe_dsa` 已接入结构发现；GLM 的 A3/A5 PrologV3 kernel 兼容性仍须
+> 由目标框架 capability manifest 或真实部署测试确认。
 
 ## 为什么核心算法不绑定模型家族
 
@@ -92,6 +92,28 @@ ModelSlim Qwen3.5 MoE adapter 提交，并声明：
 `fused_activation_proxy=module_input_a8_only`。这是一项待内网相关性实验验证的代理边界，
 不是 ModelSlim-exact W4A8/W8A8 支持声明。流式 runner 必须在内部每次矩阵乘处调用候选
 干预接口，才能把该边界升级为完整覆盖。
+
+### GLM-5.3 `glm_moe_dsa`
+
+GLM-5/5.1/5.2/5.3 共用 `glm_moe_dsa` 这一 Transformers 架构标识。内置适配器按一个
+Block 的实际模块路径拆出四个分析域：
+
+| 分析域 | 典型目标 | 当前处理 |
+| --- | --- | --- |
+| `attention` | `self_attn.*` | 可测量 W4A8/W8A8；`indexer`、`weights_proj`、`kv_b_proj`、`wk` 等保护路径排除 |
+| `dense_mlp` | 非 expert 的 `mlp.*` | 可测量；最终是否落入融合 kernel 由目标后端确认 |
+| `shared_expert` | `mlp.shared_experts.*` | 独立决策域，不与 routed expert 混合 |
+| `routed_expert` | packed `mlp.experts.gate_up_proj/down_proj` | fused 权重按 expert 原子映射；不能拆开 gate/up/down |
+
+这四类是“候选测量边界”，不是静态地宣称所有域都能在 A3/A5 使用 W4A8。公开
+ModelSlim GLM-5 W4A8 recipe 已验证的目标标签是 A2/A3；A5 没有公开的等价声明。因此
+运行结果会把 PrologV3 的输入/输出格式、融合覆盖和 kernel 命中保留为外部门禁：没有
+capability manifest 或实测报告时，只输出风险排序和候选 plan，不应把结果当成 A5 可部署 YAML。
+
+GLM DSA 的 `indexer`、`weights_proj`、`compressor`、`kv_b_proj`、`wk` 与 router 被适配器
+强制排除。原因不是它们“误差一定大”，而是它们可能属于 DSA/路由融合的控制或特殊布局，
+通用 Linear fake-quant 无法证明满足 PrologV3 的输入输出契约。若内网框架确认某路径可安全
+量化，应通过版本化 capability/architecture 插件显式放行，而不是修改命令行 exclude 绕过。
 
 ### 其他家族
 

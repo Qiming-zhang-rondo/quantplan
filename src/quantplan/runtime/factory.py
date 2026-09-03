@@ -74,16 +74,35 @@ def build_torch_runtime(config: RunConfig) -> TorchAnalysisRuntime:
         for group in potential_groups
         for module_name in group.module_names
     )
+    potential_aliases: dict[str, tuple[str, ...]] = {}
+    for group in potential_groups:
+        for module_name, backend_pattern in zip(
+            group.module_names,
+            group.effective_backend_patterns,
+            strict=True,
+        ):
+            if backend_pattern.endswith(".*"):
+                potential_aliases[module_name] = (
+                    f"{backend_pattern[:-2]}0.gate_proj",
+                    f"{backend_pattern[:-2]}0.up_proj",
+                    f"{backend_pattern[:-2]}0.down_proj",
+                )
     source_profile = profile_linear_source(
         config.original_yaml,
         potential_targets,
+        candidate_aliases=potential_aliases,
     )
     eligible = set(source_profile.eligible_modules)
-    source_groups = {
-        group.group_id: (group.group_id,)
-        for group in potential_groups
-        if eligible.intersection(group.module_names)
-    }
+    # GLM discovery exposes one inventory per fused subgroup (``block:kind``),
+    # while the explicit runtime API consumes block roots.  Collapse those
+    # subgroup IDs back to unique roots; the runtime reapplies the adapter's
+    # fusion-aware split after source-YAML filtering.
+    source_groups: dict[str, tuple[str, ...]] = {}
+    for group in potential_groups:
+        if not eligible.intersection(group.module_names):
+            continue
+        root = group.group_id.rsplit(":", 1)[0] if ":" in group.group_id else group.group_id
+        source_groups[root] = (root,)
     if not source_groups:
         raise ValueError("source YAML leaves no decision groups after target filtering")
 
@@ -103,6 +122,7 @@ def build_torch_runtime(config: RunConfig) -> TorchAnalysisRuntime:
         # Legacy loaders without placement retain the full configured constraint.
         device=_runtime_device_constraint(config.device, bundle.placement is not None),
         compute_kl=config.analysis.compute_kl,
+        hardware_profile=config.runtime.hardware_profile,
     )
     discovered_targets = {
         module_name

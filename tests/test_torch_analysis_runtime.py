@@ -8,6 +8,7 @@ import pytest
 
 from quantplan.domain.models import PrecisionFormat
 from quantplan.runtime import (
+    GLM5_MOE_DSA_ADAPTER_ID,
     PROXY_SEMANTICS,
     QWEN35_MOE_ADAPTER_ID,
     ModelBundle,
@@ -188,7 +189,12 @@ def _torch_or_skip():
     return pytest.importorskip("torch", reason="optional PyTorch dependency is not installed")
 
 
-def _toy_objects(torch, *, cast_to_bf16: bool = True):
+def _toy_objects(
+    torch,
+    *,
+    cast_to_bf16: bool = True,
+    model_type: str = "qwen3_5_moe",
+):
     nn = torch.nn
 
     class ToyTokenizer:
@@ -254,7 +260,7 @@ def _toy_objects(torch, *, cast_to_bf16: bool = True):
     class ToyCausalLM(nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.config = SimpleNamespace(model_type="qwen3_5_moe")
+            self.config = SimpleNamespace(model_type=model_type)
             hidden_size = 6
             self.embed = nn.Embedding(32, hidden_size)
             self.model = ToyBackbone(hidden_size)
@@ -332,6 +338,8 @@ def test_toy_runtime_discovers_fused_experts_excludes_router_and_restores() -> N
     assert result.provenance.context_schema == "quantplan.torch-analysis-context/v2"
     assert result.provenance.placement_schema == "quantplan.model-placement/v1"
     assert result.provenance.placement_strategy == "single_device"
+    assert result.provenance.hardware_profile == "unknown"
+    assert result.provenance.hardware_capability_status == "unknown_target_capability"
     assert result.provenance.model_devices == ("cpu",)
     assert result.provenance.target_devices == ("cpu",)
     assert len(result.provenance.placement_sha256) == 64
@@ -401,6 +409,28 @@ def test_fast_runtime_produces_finite_approximate_risk_and_restores() -> None:
     _assert_state_equal(torch, model, before)
     assert all(not module._forward_pre_hooks for module in model.modules())
     assert all(not module._forward_hooks for module in model.modules())
+
+
+def test_glm_runtime_splits_blocks_into_fusion_aware_decision_groups() -> None:
+    torch = _torch_or_skip()
+    model, tokenizer = _toy_objects(torch, model_type="glm_moe_dsa")
+    runtime = TorchAnalysisRuntime(
+        model,
+        tokenizer,
+        ["hello"],
+        linear_exclude=(),
+        hardware_profile="a3",
+    )
+
+    assert runtime.backend_adapter == GLM5_MOE_DSA_ADAPTER_ID
+    assert runtime.hardware_profile == "a3"
+    assert runtime.hardware_capability_status == "recipe_verified_only"
+    assert runtime.full_group_coverage is True
+    assert {group.kind.rsplit(".", 1)[-1] for group in runtime.groups} >= {
+        "dense_mlp",
+        "routed_expert",
+    }
+    assert all(":" in group.group_id for group in runtime.groups)
 
 
 def test_fast_runtime_failure_restores_hooks_parameters_and_grad_flags(monkeypatch) -> None:

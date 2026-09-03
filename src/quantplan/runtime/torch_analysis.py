@@ -54,6 +54,7 @@ DEFAULT_LINEAR_EXCLUDE = BASE_SAFETY_EXCLUDES
 ProgressCallback = Callable[[str, int, int, str, str], None]
 
 _PLACEMENT_STRATEGIES = frozenset({"single_device", "hf_device_map", "pre_sharded"})
+_HARDWARE_PROFILES = frozenset({"unknown", "a3", "a5"})
 
 
 class TorchAnalysisError(RuntimeError):
@@ -154,6 +155,9 @@ class RuntimeProvenance:
     loader_name: str
     loader_warnings: tuple[str, ...]
     device: str
+    hardware_profile: str
+    hardware_capability_status: str
+    fusion_contracts: tuple[str, ...]
     placement_schema: str
     placement_strategy: str
     model_devices: tuple[str, ...]
@@ -191,6 +195,9 @@ class RuntimeProvenance:
             "loader_name": self.loader_name,
             "loader_warnings": list(self.loader_warnings),
             "device": self.device,
+            "hardware_profile": self.hardware_profile,
+            "hardware_capability_status": self.hardware_capability_status,
+            "fusion_contracts": list(self.fusion_contracts),
             "placement_schema": self.placement_schema,
             "placement_strategy": self.placement_strategy,
             "model_devices": list(self.model_devices),
@@ -560,7 +567,7 @@ def _discover_runtime_groups(
         raise ValueError("max_groups must be at least one")
     if explicit_groups is not None:
         normalized = _normalize_explicit_groups(explicit_groups)
-        return _build_runtime_groups(
+        built = _build_runtime_groups(
             torch,
             modules,
             normalized,
@@ -574,6 +581,7 @@ def _discover_runtime_groups(
             strict_targets=strict_targets,
             adapter=adapter,
         )
+        return _maybe_split_decision_groups(torch, modules, built, adapter)
 
     container_path: str | None = None
     for path in adapter.preferred_block_paths:
@@ -625,7 +633,7 @@ def _discover_runtime_groups(
         selection_warning,
         "router exclusion is name-based only; verify the complete router path is locked",
     )
-    return _build_runtime_groups(
+    built = _build_runtime_groups(
         torch,
         modules,
         discovered,
@@ -635,6 +643,7 @@ def _discover_runtime_groups(
         strict_targets=strict_targets,
         adapter=adapter,
     )
+    return _maybe_split_decision_groups(torch, modules, built, adapter)
 
 
 class TorchAnalysisRuntime:
@@ -661,6 +670,7 @@ class TorchAnalysisRuntime:
         loader_warnings: Sequence[str] = (),
         placement: ModelPlacement | None = None,
         context_id: str | None = None,
+        hardware_profile: str = "unknown",
     ) -> None:
         self._torch = _require_torch()
         if batch_size < 1:
@@ -709,6 +719,24 @@ class TorchAnalysisRuntime:
         self.batch_size = batch_size
         self.max_length = max_length
         self.compute_kl = bool(compute_kl)
+        normalized_hardware_profile = str(hardware_profile).strip().lower()
+        if normalized_hardware_profile not in _HARDWARE_PROFILES:
+            raise ValueError(
+                "hardware_profile must be one of unknown, a3 or a5"
+            )
+        self.hardware_profile = normalized_hardware_profile
+        recipe_hardware = tuple(
+            str(item).strip().lower()
+            for item in getattr(self.architecture_adapter, "recipe_verified_hardware", ())
+        )
+        self.hardware_capability_status = (
+            "recipe_verified_only"
+            if self.hardware_profile in recipe_hardware
+            else "unknown_target_capability"
+        )
+        self.fusion_contracts = tuple(
+            str(item) for item in getattr(self.architecture_adapter, "fusion_contracts", ())
+        )
         self.model_id = model_id
         self.model_revision = model_revision
         self.loader_name = loader_name
@@ -905,7 +933,6 @@ class TorchAnalysisRuntime:
         self._assert_context_integrity()
         modules = dict(self.model.named_modules())
         bindings: list[tuple[_RuntimeGroup, Any]] = []
-        block_owners: dict[int, str] = {}
         for group in self._runtime_groups:
             if len(group.block_module_names) != 1:
                 raise TorchAnalysisError(
@@ -916,12 +943,6 @@ class TorchAnalysisRuntime:
             block = modules.get(block_name)
             if block is None:
                 raise TorchAnalysisError(f"fast mode block root disappeared: {block_name!r}")
-            previous = block_owners.setdefault(id(block), group.inventory.group_id)
-            if previous != group.inventory.group_id:
-                raise TorchAnalysisError(
-                    f"fast mode groups {previous!r} and {group.inventory.group_id!r} "
-                    "share a block root"
-                )
             bindings.append((group, block))
 
         total = len(bindings) * len(normalized)
@@ -1293,6 +1314,9 @@ class TorchAnalysisRuntime:
             "max_length": self.max_length,
             "batch_size": self.batch_size,
             "device": self.device,
+            "hardware_profile": self.hardware_profile,
+            "hardware_capability_status": self.hardware_capability_status,
+            "fusion_contracts": list(self.fusion_contracts),
             "placement": {
                 **placement.placement.to_dict(),
                 "model_devices": list(placement.model_devices),
@@ -1596,6 +1620,9 @@ class TorchAnalysisRuntime:
             loader_name=self.loader_name,
             loader_warnings=self.loader_warnings,
             device=self.device,
+            hardware_profile=self.hardware_profile,
+            hardware_capability_status=self.hardware_capability_status,
+            fusion_contracts=self.fusion_contracts,
             placement_schema=PLACEMENT_SCHEMA,
             placement_strategy=self.placement.strategy,
             model_devices=self.model_devices,
@@ -2061,6 +2088,92 @@ def _kl_sum(torch: Any, reference_logits: Any, candidate_logits: Any, mask: Any)
         device=token_kl.device, dtype=torch.bool
     )
     return float(token_kl.masked_select(valid).sum().item())
+
+
+def _maybe_split_decision_groups(
+    torch: Any,
+    modules: Mapping[str, Any],
+    groups: Sequence[_RuntimeGroup],
+    adapter: ArchitectureAdapter,
+) -> tuple[_RuntimeGroup, ...]:
+    """Split GLM blocks into backend-compatible quantization domains.
+
+    GLM-5's published W4A8 recipe keeps attention and shared experts at W8A8
+    while assigning routed experts to W4A8.  Treating a whole block as one
+    decision would make that recipe inexpressible and would also hide fusion
+    boundaries from the planner.
+    """
+
+    if getattr(adapter, "decision_grouping", None) != "glm5_fused_subgroups/v1":
+        return tuple(groups)
+    split: list[_RuntimeGroup] = []
+    for group in groups:
+        if len(group.block_module_names) != 1:
+            raise DiscoveryError(
+                "GLM fine-grained grouping requires one block root per discovered block"
+            )
+        root = group.block_module_names[0]
+        categories: dict[str, tuple[list[str], list[_ExpertTarget]]] = {
+            "attention": ([], []),
+            "dense_mlp": ([], []),
+            "shared_expert": ([], []),
+            "routed_expert": ([], []),
+        }
+        for name in group.linear_module_names:
+            if ".self_attn." in name:
+                category = "attention"
+            elif ".mlp.shared_experts." in name:
+                category = "shared_expert"
+            elif ".mlp." in name:
+                category = "dense_mlp"
+            else:
+                category = "attention"
+            categories[category][0].append(name)
+        for target in group.expert_targets:
+            categories["routed_expert"][1].append(target)
+
+        for category, (linears, experts) in categories.items():
+            if not linears and not experts:
+                continue
+            module_names = (*linears, *(target.module_name for target in experts))
+            parameter_count = sum(
+                int(modules[name].weight.numel()) for name in linears
+            ) + sum(
+                int(getattr(modules[target.module_name], parameter_name).numel())
+                for target in experts
+                for parameter_name in target.parameter_names
+            )
+            warnings = (
+                *group.inventory.warnings,
+                f"decision_granularity=glm5_fused_subgroups/v1:{category}",
+                (
+                    "fusion-aware proposal domain; final ModelSlim/PrologV3 kernel compatibility "
+                    "must be checked on the target hardware"
+                ),
+            )
+            split.append(
+                _RuntimeGroup(
+                    inventory=GroupInventory(
+                        group_id=f"{group.inventory.group_id}:{category}",
+                        module_names=module_names,
+                        parameter_count=parameter_count,
+                        kind=f"{group.inventory.kind}.{category}",
+                        warnings=warnings,
+                        backend_patterns=(
+                            *linears,
+                            *(target.backend_pattern for target in experts),
+                        ),
+                    ),
+                    block_module_names=(root,),
+                    linear_module_names=tuple(linears),
+                    expert_targets=tuple(experts),
+                )
+            )
+    if not split:
+        raise DiscoveryError(
+            f"GLM adapter produced no fine-grained quantization domains for {groups[0].inventory.group_id!r}"
+        )
+    return tuple(split)
 
 
 def _build_runtime_groups(

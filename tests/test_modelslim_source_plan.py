@@ -86,3 +86,33 @@ spec:
             source,
             ("model.layers.0.q_proj", "model.layers.1.q_proj"),
         )
+
+
+def test_source_profile_matches_packed_runtime_target_through_backend_alias(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.yaml"
+    source.write_text(
+        """\
+apiversion: modelslim_v1
+spec:
+  process:
+    - type: linear_quant
+      qconfig:
+        act: {dtype: int8, scope: per_token, symmetric: true, method: minmax}
+        weight: {dtype: int4, scope: per_channel, symmetric: true, method: ssz}
+      include: ['*mlp.experts.*']
+""",
+        encoding="utf-8",
+    )
+
+    packed = "model.layers.0.mlp.experts"
+    profile = profile_linear_source(
+        source,
+        (packed,),
+        candidate_aliases={
+            packed: ("model.layers.0.mlp.experts.0.gate_proj",),
+        },
+    )
+
+    assert profile.eligible_modules == (packed,)

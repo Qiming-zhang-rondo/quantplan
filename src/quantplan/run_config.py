@@ -38,6 +38,7 @@ class RuntimeConfig:
     trust_remote_code: bool = False
     strict_target_coverage: bool = True
     allow_image_text_fallback: bool = False
+    hardware_profile: str = "unknown"
 
     def __post_init__(self) -> None:
         if not _valid_loader(self.loader):
@@ -66,6 +67,15 @@ class RuntimeConfig:
         _require_bool(
             self.strict_target_coverage, "$.runtime.strict_target_coverage"
         )
+        if not isinstance(self.hardware_profile, str) or self.hardware_profile.strip().lower() not in {
+            "unknown",
+            "a3",
+            "a5",
+        }:
+            raise RunConfigError(
+                "$.runtime.hardware_profile must be one of unknown, a3 or a5"
+            )
+        object.__setattr__(self, "hardware_profile", self.hardware_profile.strip().lower())
 
 
 @dataclass(frozen=True)
@@ -451,6 +461,7 @@ def parse_run_config(
             "trust_remote_code",
             "allow_image_text_fallback",
             "strict_target_coverage",
+            "hardware_profile",
         },
         "$.runtime",
     )
@@ -469,6 +480,10 @@ def parse_run_config(
         strict_target_coverage=_bool(
             runtime_doc.get("strict_target_coverage", True),
             "$.runtime.strict_target_coverage",
+        ),
+        hardware_profile=_string(
+            runtime_doc.get("hardware_profile", "unknown"),
+            "$.runtime.hardware_profile",
         ),
     )
 
@@ -836,6 +851,8 @@ runtime:
   # Explicit opt-in only; this does not synthesize image inputs.
   allow_image_text_fallback: false
   strict_target_coverage: true
+  # GLM-5.3 target binding: unknown, a3 or a5.
+  hardware_profile: unknown
 
 # Empty block/include selectors defer discovery to the runtime inventory. The
 # conservative excludes remain locked, and unknown target coverage fails closed.

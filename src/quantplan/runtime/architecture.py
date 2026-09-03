@@ -32,6 +32,23 @@ QWEN35_SAFETY_EXCLUDES = (
 GENERIC_ADAPTER_ID = "generic.nn_linear/v1"
 QWEN35_MODELSLIM_COMMIT = "376e2fad43bc999f9a49b48bdbc3eef06ffdd83a"
 QWEN35_MOE_ADAPTER_ID = f"modelslim.qwen3_5_moe/{QWEN35_MODELSLIM_COMMIT}"
+GLM5_MODELSLIM_COMMIT = "26.1.0"
+GLM5_MOE_DSA_ADAPTER_ID = f"modelslim.glm_moe_dsa/{GLM5_MODELSLIM_COMMIT}"
+GLM5_SAFETY_EXCLUDES = (
+    *BASE_SAFETY_EXCLUDES,
+    "*indexer*",
+    "*weights_proj*",
+    "*compressor*",
+    "*kv_b_proj*",
+    "*wk*",
+)
+GLM5_FUSION_CONTRACTS = (
+    "attention:self_attn+indexer-boundary",
+    "dense_mlp:backend-dependent",
+    "shared_expert:backend-dependent",
+    "routed_expert:atomic_gate_up_down",
+)
+GLM5_RECIPE_VERIFIED_HARDWARE = ("a2", "a3")
 ARCHITECTURE_ADAPTER_ENTRY_POINT = "quantplan.architecture_adapters"
 
 
@@ -189,6 +206,72 @@ class Qwen35MoeModelSlimAdapter:
         if len(expert_counts) != 1 or next(iter(expert_counts)) < 1:
             raise ArchitectureTargetMappingError(
                 f"Qwen3.5 fused target {module_name} has inconsistent expert dimensions"
+            )
+        expert_count = next(iter(expert_counts))
+        backend_names = tuple(
+            f"{module_name}.{expert_index}.{projection}"
+            for expert_index in range(expert_count)
+            for projection in ("gate_proj", "up_proj", "down_proj")
+        )
+        return FusedTargetMapping(
+            runtime_parameter_names=expected,
+            backend_module_names=backend_names,
+            backend_pattern=f"{module_name}.*",
+        )
+
+
+@dataclass(frozen=True)
+class GlmMoeDsaModelSlimAdapter:
+    """GLM-5/5.1/5.2/5.3 DSA and packed-MoE mapping for ModelSlim 26.1.0."""
+
+    adapter_id: str = GLM5_MOE_DSA_ADAPTER_ID
+    fallback: bool = False
+    preferred_block_paths: tuple[str, ...] = (
+        "model.layers",
+        "language_model.layers",
+        "model.language_model.layers",
+        "model.model.layers",
+        "model.model.language_model.layers",
+    )
+    nonremovable_exclude_patterns: tuple[str, ...] = GLM5_SAFETY_EXCLUDES
+    allow_block_path_fallback: bool = False
+    decision_grouping: str = "glm5_fused_subgroups/v1"
+    fusion_contracts: tuple[str, ...] = GLM5_FUSION_CONTRACTS
+    recipe_verified_hardware: tuple[str, ...] = GLM5_RECIPE_VERIFIED_HARDWARE
+
+    def matches(self, model: Any, config: Any | None = None) -> bool:
+        resolved_config = config if config is not None else getattr(model, "config", None)
+        model_type = str(getattr(resolved_config, "model_type", "") or "").lower()
+        return model_type == "glm_moe_dsa"
+
+    def map_fused_target(
+        self,
+        module_name: str,
+        module: Any,
+        direct_parameters: Mapping[str, Any],
+    ) -> FusedTargetMapping | None:
+        del module
+        expected = ("gate_up_proj", "down_proj")
+        present = tuple(name for name in expected if name in direct_parameters)
+        if not present:
+            return None
+        missing = tuple(name for name in expected if name not in direct_parameters)
+        wrong_rank = tuple(
+            name
+            for name in present
+            if getattr(direct_parameters[name], "ndim", None) != 3
+        )
+        if missing or wrong_rank:
+            raise ArchitectureTargetMappingError(
+                f"unsupported GLM-MoE fused target {module_name}: "
+                f"missing={list(missing)}, non_3d={list(wrong_rank)}"
+            )
+        expert_counts = {
+            int(direct_parameters[name].shape[0]) for name in expected
+        }
+        if len(expert_counts) != 1 or next(iter(expert_counts)) < 1:
+            raise ArchitectureTargetMappingError(
+                f"GLM-MoE fused target {module_name} has inconsistent expert dimensions"
             )
         expert_count = next(iter(expert_counts))
         backend_names = tuple(
@@ -386,7 +469,7 @@ def _installed_entry_points() -> tuple[Any, ...]:
 
 
 _GLOBAL_REGISTRY = ArchitectureAdapterRegistry(
-    (Qwen35MoeModelSlimAdapter(), GenericLinearAdapter())
+    (GlmMoeDsaModelSlimAdapter(), Qwen35MoeModelSlimAdapter(), GenericLinearAdapter())
 )
 
 
@@ -425,6 +508,11 @@ __all__ = [
     "ARCHITECTURE_ADAPTER_ENTRY_POINT",
     "BASE_SAFETY_EXCLUDES",
     "GENERIC_ADAPTER_ID",
+    "GLM5_FUSION_CONTRACTS",
+    "GLM5_MODELSLIM_COMMIT",
+    "GLM5_MOE_DSA_ADAPTER_ID",
+    "GLM5_RECIPE_VERIFIED_HARDWARE",
+    "GLM5_SAFETY_EXCLUDES",
     "QWEN35_MODELSLIM_COMMIT",
     "QWEN35_MOE_ADAPTER_ID",
     "QWEN35_SAFETY_EXCLUDES",
@@ -436,6 +524,7 @@ __all__ = [
     "ArchitectureTargetMappingError",
     "FusedTargetMapping",
     "GenericLinearAdapter",
+    "GlmMoeDsaModelSlimAdapter",
     "Qwen35MoeModelSlimAdapter",
     "register_architecture_adapter",
     "registered_architecture_adapters",

@@ -8,12 +8,14 @@ import pytest
 from quantplan.runtime.architecture import (
     ARCHITECTURE_ADAPTER_ENTRY_POINT,
     GENERIC_ADAPTER_ID,
+    GLM5_MOE_DSA_ADAPTER_ID,
     QWEN35_MOE_ADAPTER_ID,
     ArchitectureAdapterRegistry,
     ArchitectureAdapterResolutionError,
     ArchitectureTargetMappingError,
     FusedTargetMapping,
     GenericLinearAdapter,
+    GlmMoeDsaModelSlimAdapter,
     Qwen35MoeModelSlimAdapter,
 )
 
@@ -72,6 +74,41 @@ def test_registry_prefers_exact_qwen_adapter_and_keeps_generic_fallback() -> Non
     assert registry.resolve(_model()).adapter_id == GENERIC_ADAPTER_ID
     assert registry.resolve(_model("qwen3_5_moe")).adapter_id == QWEN35_MOE_ADAPTER_ID
     assert registry.resolve(_model("qwen3_5_moe_text")).adapter_id == QWEN35_MOE_ADAPTER_ID
+
+
+def test_registry_resolves_glm_moe_dsa_adapter() -> None:
+    registry = ArchitectureAdapterRegistry(
+        (GlmMoeDsaModelSlimAdapter(), GenericLinearAdapter())
+    )
+
+    assert registry.resolve(_model("glm_moe_dsa")).adapter_id == GLM5_MOE_DSA_ADAPTER_ID
+
+
+def test_glm_adapter_declares_fusion_domains_and_protected_dsa_paths() -> None:
+    adapter = GlmMoeDsaModelSlimAdapter()
+
+    assert adapter.decision_grouping == "glm5_fused_subgroups/v1"
+    assert adapter.recipe_verified_hardware == ("a2", "a3")
+    assert "*weights_proj*" in adapter.nonremovable_exclude_patterns
+    assert "*kv_b_proj*" in adapter.nonremovable_exclude_patterns
+    assert "routed_expert:atomic_gate_up_down" in adapter.fusion_contracts
+
+
+def test_glm_adapter_maps_packed_experts_without_splitting_gate_up_down() -> None:
+    adapter = GlmMoeDsaModelSlimAdapter()
+    mapping = adapter.map_fused_target(
+        "model.layers.0.mlp.experts",
+        object(),
+        {
+            "gate_up_proj": SimpleNamespace(ndim=3, shape=(4, 16, 8)),
+            "down_proj": SimpleNamespace(ndim=3, shape=(4, 8, 8)),
+        },
+    )
+
+    assert mapping is not None
+    assert mapping.runtime_parameter_names == ("gate_up_proj", "down_proj")
+    assert mapping.backend_pattern == "model.layers.0.mlp.experts.*"
+    assert len(mapping.backend_module_names) == 12
 
 
 def test_qwen_adapter_locks_architecture_specific_unsafe_targets() -> None:

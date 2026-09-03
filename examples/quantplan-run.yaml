@@ -17,6 +17,8 @@ runtime:
   # Explicit opt-in only; this does not synthesize image inputs.
   allow_image_text_fallback: false
   strict_target_coverage: true
+  # GLM-5.3 target binding: unknown, a3 or a5.
+  hardware_profile: unknown
 
 # Empty block/include selectors defer discovery to the runtime inventory. The
 # conservative excludes remain locked, and unknown target coverage fails closed.
