@@ -1,5 +1,6 @@
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,7 +15,7 @@ from quantplan.domain import (
     PlanEvaluation,
     PrecisionFormat,
 )
-from quantplan.run_config import loads_run_config
+from quantplan.run_config import CandidateConfig, loads_run_config
 from quantplan.workflow import execute_workflow
 
 
@@ -146,6 +147,24 @@ class _BackendBlockedRuntime(_FakeRuntime):
     backend_compilation_blockers = ("unverified fused expert mapping",)
 
 
+class _SourceAnchoredRuntime(_FakeRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.groups = tuple(
+            replace(
+                group,
+                allowed_formats=(PrecisionFormat.W8A8,),
+                source_precision=PrecisionFormat.W8A8,
+            )
+            for group in self.groups
+        )
+        self.seen_precisions = ()
+
+    def run(self, precisions, *, progress_callback=None):
+        self.seen_precisions = tuple(precisions)
+        return super().run(precisions, progress_callback=progress_callback)
+
+
 def _make_config(tmp_path: Path):
     model = tmp_path / "model"
     model.mkdir()
@@ -198,6 +217,37 @@ def test_workflow_emits_yaml_only_after_a_plan_passes(tmp_path: Path) -> None:
     assert (output / "run-manifest.json").read_text(encoding="utf-8").find(
         "complete_analysis_only"
     ) > 0
+
+
+def test_workflow_adds_source_yaml_anchor_when_candidate_omits_it(tmp_path: Path) -> None:
+    config, output = _make_config(tmp_path)
+    config.original_yaml.write_text(
+        config.original_yaml.read_text(encoding="utf-8").replace(
+            "weight: {dtype: int4", "weight: {dtype: int8"
+        ),
+        encoding="utf-8",
+    )
+    config = replace(
+        config,
+        candidates=CandidateConfig((PrecisionFormat.W4A8,)),
+    )
+    runtime = _SourceAnchoredRuntime()
+
+    result = execute_workflow(config, runtime)
+
+    assert result.status == "complete_analysis_only"
+    assert runtime.seen_precisions == (PrecisionFormat.W4A8, PrecisionFormat.W8A8)
+    candidate_set = json.loads(
+        (output / "candidate-plan.json").read_text(encoding="utf-8")
+    )
+    assert candidate_set["source_yaml_safe_anchors"] == {
+        "block_0": "w8a8",
+        "block_1": "w8a8",
+    }
+    assert all(
+        set(plan["assignments"].values()) == {"w8a8"}
+        for plan in candidate_set["plans"]
+    )
 
 
 def test_fast_workflow_uses_approximate_ranking_then_exact_validation(

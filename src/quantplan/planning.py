@@ -183,7 +183,10 @@ def build_candidate_set(
                 f"missing base measurement for {inventory.group_id}/"
                 f"{base_precision.value}"
             )
-        if (inventory.group_id, PrecisionFormat.BF16) not in by_key:
+        if (
+            PrecisionFormat.BF16 in group.allowed_formats
+            and (inventory.group_id, PrecisionFormat.BF16) not in by_key
+        ):
             evidence.append(
                 CandidateEvidence(
                     group_id=inventory.group_id,
@@ -199,8 +202,9 @@ def build_candidate_set(
             )
 
     available_by_group = {
-        group_id: {precision for (candidate_group, precision) in by_key if candidate_group == group_id}
-        | {PrecisionFormat.BF16}
+        group_id: {
+            item.precision for item in evidence if item.group_id == group_id
+        }
         for group_id in inventory_by_id
     }
     groups = tuple(
@@ -211,6 +215,7 @@ def build_candidate_set(
             allowed_formats=tuple(
                 precision
                 for precision in formats
+                if precision in group.allowed_formats
                 if precision in available_by_group[group.group_id]
             ),
         )
@@ -329,7 +334,7 @@ def _inventory_formats(
         for precision in formats
         if inventory.allowed_formats is None or precision in inventory.allowed_formats
     )
-    if PrecisionFormat.BF16 not in allowed:
+    if inventory.allowed_formats is None and PrecisionFormat.BF16 not in allowed:
         allowed += (PrecisionFormat.BF16,)
     return allowed
 

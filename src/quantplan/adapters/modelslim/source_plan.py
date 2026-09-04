@@ -31,6 +31,7 @@ class SourceTemplate:
 class LinearSourceProfile:
     source_sha256: str
     eligible_modules: tuple[str, ...]
+    module_precisions: tuple[tuple[str, PrecisionFormat], ...]
     templates: tuple[SourceTemplate, ...]
     linear_process_count: int
 
@@ -39,6 +40,11 @@ class LinearSourceProfile:
             item.precision: copy.deepcopy(dict(item.qconfig))
             for item in self.templates
         }
+
+    def precision_map(self) -> dict[str, PrecisionFormat]:
+        """Return the recognized source-YAML precision for each runtime target."""
+
+        return dict(self.module_precisions)
 
 
 @dataclass(frozen=True)
@@ -90,6 +96,7 @@ def profile_linear_source(
     covered: set[str] = set()
     templates: dict[PrecisionFormat, dict[str, Any]] = {}
     template_hashes: dict[PrecisionFormat, str] = {}
+    module_precisions: dict[str, PrecisionFormat] = {}
     linear_process_count = 0
     for process in _walk_processes(processes):
         if process.get("type") != "linear_quant":
@@ -121,6 +128,14 @@ def profile_linear_source(
         precision = _qconfig_precision(qconfig)
         if precision is None:
             continue
+        for name in matched:
+            previous_precision = module_precisions.get(name)
+            if previous_precision is not None and previous_precision is not precision:
+                raise SourcePlanError(
+                    "source YAML assigns multiple recognized precisions to target "
+                    f"{name!r}: {previous_precision.value}, {precision.value}"
+                )
+            module_precisions[name] = precision
         plain = _plain_mapping(qconfig, "linear_quant.qconfig")
         digest = _content_hash(plain)
         previous = template_hashes.get(precision)
@@ -146,6 +161,11 @@ def profile_linear_source(
     return LinearSourceProfile(
         source_sha256=source_sha256,
         eligible_modules=eligible,
+        module_precisions=tuple(
+            (name, module_precisions[name])
+            for name in candidates
+            if name in module_precisions
+        ),
         templates=tuple(
             SourceTemplate(precision, templates[precision], template_hashes[precision])
             for precision in sorted(templates, key=lambda item: item.value)

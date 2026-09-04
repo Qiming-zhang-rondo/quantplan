@@ -155,6 +155,43 @@ def test_domain_allowed_formats_filter_unsupported_w4_candidate() -> None:
     )
 
 
+def test_source_locked_domain_does_not_invent_bf16_fallback() -> None:
+    inventory = GroupInventory(
+        "mla_preprocess",
+        ("model.layers.0.q_proj",),
+        100,
+        quantization_domain="mla_preprocess",
+        allowed_formats=(PrecisionFormat.W8A8,),
+        source_precision=PrecisionFormat.W8A8,
+    )
+    result = build_candidate_set(
+        (inventory,),
+        (
+            _measurement(
+                "mla_preprocess",
+                PrecisionFormat.W4A8,
+                2.5,
+                modules=inventory.module_names,
+            ),
+            _measurement(
+                "mla_preprocess",
+                PrecisionFormat.W8A8,
+                2.1,
+                modules=inventory.module_names,
+            ),
+        ),
+        allowed_formats=(PrecisionFormat.W4A8, PrecisionFormat.W8A8),
+        policy=PlanningPolicy(max_high_precision_fraction=1.0),
+    )
+
+    assert result.plans
+    assert all(
+        plan.assignments["mla_preprocess"] is PrecisionFormat.W8A8
+        for plan in result.plans
+    )
+    assert all(item.precision is not PrecisionFormat.BF16 for item in result.evidence)
+
+
 def test_choose_lowest_cost_plan_uses_whole_plan_validation() -> None:
     inventory = GroupInventory("block_0", ("layers.0.fc",), 100)
     result = build_candidate_set(

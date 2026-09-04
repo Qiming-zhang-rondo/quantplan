@@ -436,6 +436,53 @@ def test_glm_runtime_splits_blocks_into_fusion_aware_decision_groups() -> None:
     assert all(":" in group.group_id for group in runtime.groups)
 
 
+def test_glm_unknown_capability_keeps_source_yaml_anchor_and_prunes_w4() -> None:
+    torch = _torch_or_skip()
+    model, tokenizer = _toy_objects(torch, model_type="glm_moe_dsa")
+    for block in model.model.language_model.layers:
+        block.q_proj = torch.nn.Linear(6, 6, bias=False).to(dtype=torch.bfloat16)
+    discovered = torch_analysis.discover_transformer_blocks(
+        model,
+        linear_exclude=(),
+    )
+    source_precisions = {
+        module_name: PrecisionFormat.W8A8
+        for group in discovered
+        for module_name in group.module_names
+    }
+    runtime = TorchAnalysisRuntime(
+        model,
+        tokenizer,
+        ["hello"],
+        linear_exclude=(),
+        hardware_profile="a5",
+        source_precision_by_module=source_precisions,
+    )
+
+    constrained = tuple(
+        group for group in runtime.groups if group.quantization_domain != "independent"
+    )
+    assert constrained
+    assert all(group.source_precision is PrecisionFormat.W8A8 for group in runtime.groups)
+    assert all(group.allowed_formats == (PrecisionFormat.W8A8,) for group in constrained)
+    source_plan = {group.group_id: PrecisionFormat.W8A8 for group in runtime.groups}
+    assert runtime.plan_compilation_blockers(source_plan) == ()
+    changed_plan = dict(source_plan)
+    changed_plan[constrained[0].group_id] = PrecisionFormat.W4A8
+    assert any(
+        "protected quantization domains" in blocker
+        for blocker in runtime.plan_compilation_blockers(changed_plan)
+    )
+
+    result = runtime.run((PrecisionFormat.W4A8, PrecisionFormat.W8A8))
+    constrained_ids = {group.group_id for group in constrained}
+    assert not any(
+        item.group_id in constrained_ids and item.precision is PrecisionFormat.W4A8
+        for item in result.measurements
+    )
+    assert result.provenance.full_model_dataset_passes < 1 + len(runtime.groups) * 2
+
+
 def test_fast_runtime_failure_restores_hooks_parameters_and_grad_flags(monkeypatch) -> None:
     torch = _torch_or_skip()
     model, tokenizer = _toy_objects(torch)

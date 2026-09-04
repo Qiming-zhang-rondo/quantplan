@@ -133,6 +133,7 @@ def build_torch_runtime(config: RunConfig) -> TorchAnalysisRuntime:
             if config.runtime.backend_capability_manifest is not None
             else None
         ),
+        source_precision_by_module=source_profile.precision_map(),
     )
     discovered_targets = {
         module_name

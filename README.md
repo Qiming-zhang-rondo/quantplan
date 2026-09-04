@@ -91,9 +91,17 @@ quantplan init quantplan-run.yaml \
 `runtime.backend_capability_manifest: /path/to/prologv3-capability.yaml`。快照中的
 backend version、git commit、硬件 profile、合法 quant mode 和 contract 会写入 provenance；
 升级 vLLM-Ascend/PrologV3 后应重新生成快照并重新分析。没有快照或快照不是 `verified` 时，
-GLM 仍可输出风险证据，但会阻止派生 YAML。即使快照是 `verified`，它也只声明“可能使用
-这个算子”；还需要框架插件调用真实 resolver，并返回 `runtime_selected=true`，才能证明
-本次配置确实选择了该高速算子。
+GLM 仍可输出风险证据，并可生成保持受约束融合域原配置不变的派生 YAML；若计划要改变这些
+域则会阻断。即使快照是 `verified`，它也只声明“可能使用这个算子”；还需要框架插件调用
+真实 resolver，并返回 `runtime_selected=true`，才能证明改变后的配置仍选择该高速算子。
+
+原始 ModelSlim YAML 同时是已知可部署方案的安全锚点。QuantPlan 会根据每条
+`linear_quant` 的 include/exclude 和 qconfig，记录每个候选模块原本是 W4A8 还是 W8A8。
+当某个融合域的 capability 缺失或为 `unknown` 时，该域保持原 YAML 精度，不再默认改成
+BF16；候选不支持或证据不足时也回到这个锚点。只有无法识别原始精度时才使用 BF16
+fail-closed。一个决策域若被原 YAML 配成多种精度，当前标量决策模型无法无损表达，必须先
+由架构插件拆分该域，否则阻断。原 YAML 证明的是原配置可用，不会自动证明新候选也能命中
+同一高速算子。
 
 ### 3. 预检
 
@@ -118,6 +126,9 @@ quantplan run --config quantplan-run.yaml --mode exact
 
 快速模式使用一次完整数据集前向和一次反向获得各 Block 输出对
 teacher-forced NLL 的梯度，再分别对 W4A8/W8A8 做 Block 局部无状态重放：
+
+已被 capability 排除的候选不会进入整模型干预或局部重放；原 YAML 的安全锚点即使没有
+列在 `candidates.precisions` 中也会自动加入分析，确保每个决策域始终存在可回退方案。
 
 ```bash
 quantplan run --config quantplan-run.yaml --mode fast

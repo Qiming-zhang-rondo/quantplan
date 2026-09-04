@@ -15,6 +15,11 @@ model architecture + inference framework + framework version/commit
 模型侧只产生中性的 `mla_preprocess` quantization domain，不把它命名成 PrologV3。
 框架解析结果再决定这个 domain 的 runtime owner 是 PrologV3、MLAPO、NATIVE 或其他算子。
 
+输入 ModelSlim YAML 是已知可执行配置的安全锚点。框架插件约束的是“从锚点切换到新精度”
+是否合法，而不是重新证明锚点本身。capability 未知时，QuantPlan 禁止改变对应融合域并保留
+原 YAML 精度；capability 明确允许 W4A8/W8A8 时才开放相应候选。原 YAML 与 capability
+声明冲突时仍保留原精度，同时记录冲突，不能据此推断其他精度同样可用。
+
 ## 插件合同
 
 入口组为 `quantplan.inference_framework_adapters`。插件实现：
@@ -55,4 +60,5 @@ runtime:
 
 `inference_framework: auto` 会优先使用 capability snapshot 声明的 backend；没有 snapshot
 时退回 analysis-only。只有框架插件调用真实 resolver 后返回 `status=verified` 且
-`runtime_selected=true`，才算完成高速算子选择验证；否则 YAML 编译阻断。
+`runtime_selected=true`，才算完成高速算子选择验证；否则只能编译保持受约束融合域与原
+YAML 一致的计划，任何改变该域的计划都会阻断。

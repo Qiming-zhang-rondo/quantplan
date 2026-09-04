@@ -163,9 +163,19 @@ def execute_workflow(
             "analysis_started",
             {"groups": len(runtime.groups), "analysis_mode": analysis_mode},
         )
+        source_anchor_precisions = tuple(
+            dict.fromkeys(
+                group.source_precision
+                for group in groups
+                if group.source_precision is not None
+            )
+        )
+        analysis_precisions = tuple(
+            dict.fromkeys((*config.candidates.precisions, *source_anchor_precisions))
+        )
         analysis_runner = runtime.run if analysis_mode == "exact" else runtime.run_fast
         result = analysis_runner(
-            config.candidates.precisions,
+            analysis_precisions,
             progress_callback=_measurement_progress(progress),
         )
         measurements = tuple(result.measurements)
@@ -198,7 +208,7 @@ def execute_workflow(
         candidate_set = build_candidate_set(
             groups,
             measurements,
-            allowed_formats=config.candidates.precisions,
+            allowed_formats=analysis_precisions,
             policy=planning_policy,
             relative_costs=config.search.costs,
         )
@@ -215,6 +225,11 @@ def execute_workflow(
                 else "unvalidated proposals from gradient-weighted local approximations"
             ),
             "max_estimated_cost": candidate_set.max_estimated_cost,
+            "source_yaml_safe_anchors": {
+                group.group_id: group.source_precision.value
+                for group in groups
+                if group.source_precision is not None
+            },
             "rejected_reasons": list(candidate_set.rejected_reasons),
             "plans": [_plan_payload(plan) for plan in candidate_set.plans],
         }
@@ -356,9 +371,14 @@ def execute_workflow(
                 derived_yaml=None,
                 validation=selected_evaluation,
             )
-        backend_compilation_ready = bool(getattr(runtime, "backend_compilation_ready", True))
-        if not backend_compilation_ready:
+        blocker_resolver = getattr(runtime, "plan_compilation_blockers", None)
+        if callable(blocker_resolver):
+            blockers = tuple(blocker_resolver(selected_plan.assignments))
+        elif not bool(getattr(runtime, "backend_compilation_ready", True)):
             blockers = tuple(getattr(runtime, "backend_compilation_blockers", ()))
+        else:
+            blockers = ()
+        if blockers:
             _write_provenance(
                 store,
                 config,

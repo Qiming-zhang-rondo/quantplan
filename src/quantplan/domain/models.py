@@ -98,6 +98,7 @@ class GroupInventory:
     backend_patterns: tuple[str, ...] = ()
     quantization_domain: str = "independent"
     allowed_formats: tuple[PrecisionFormat, ...] | None = None
+    source_precision: PrecisionFormat | None = None
 
     def __post_init__(self) -> None:
         if not self.group_id:
@@ -122,6 +123,10 @@ class GroupInventory:
                 raise ValueError("allowed_formats must contain PrecisionFormat values")
             if len(set(self.allowed_formats)) != len(self.allowed_formats):
                 raise ValueError("allowed_formats must not contain duplicates")
+        if self.source_precision is not None and not isinstance(
+            self.source_precision, PrecisionFormat
+        ):
+            raise ValueError("source_precision must be a PrecisionFormat or None")
 
     @property
     def effective_backend_patterns(self) -> tuple[str, ...]:

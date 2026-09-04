@@ -46,6 +46,10 @@ spec:
     )
 
     assert profile.eligible_modules == (modules[0], modules[2])
+    assert profile.precision_map() == {
+        modules[0]: PrecisionFormat.W8A8,
+        modules[2]: PrecisionFormat.W8A8,
+    }
     assert resolution.templates[PrecisionFormat.W8A8]["weight"]["dtype"] == "int8"
     w4_weight = resolution.templates[PrecisionFormat.W4A8]["weight"]
     assert w4_weight == {
@@ -86,6 +90,33 @@ spec:
             source,
             ("model.layers.0.q_proj", "model.layers.1.q_proj"),
         )
+
+
+def test_source_profile_rejects_overlapping_precisions_for_one_target(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.yaml"
+    source.write_text(
+        """\
+apiversion: modelslim_v1
+spec:
+  process:
+    - type: linear_quant
+      qconfig:
+        act: {dtype: int8}
+        weight: {dtype: int8}
+      include: ['model.layers.*']
+    - type: linear_quant
+      qconfig:
+        act: {dtype: int8}
+        weight: {dtype: int4}
+      include: ['model.layers.0.*']
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SourcePlanError, match="multiple recognized precisions"):
+        profile_linear_source(source, ("model.layers.0.q_proj",))
 
 
 def test_source_profile_matches_packed_runtime_target_through_backend_alias(

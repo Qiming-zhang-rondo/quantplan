@@ -701,6 +701,7 @@ class TorchAnalysisRuntime:
         hardware_profile: str = "unknown",
         capability_snapshot: CapabilitySnapshot | None = None,
         inference_framework: str = "auto",
+        source_precision_by_module: Mapping[str, PrecisionFormat] | None = None,
     ) -> None:
         self._torch = _require_torch()
         if batch_size < 1:
@@ -749,6 +750,7 @@ class TorchAnalysisRuntime:
                 if self.operator_resolution.status in {"capability_declared", "verified"}
                 else None
             ),
+            source_precision_by_module=source_precision_by_module,
         )
         self.discovered_group_count = len(discovered_groups)
         self.all_groups = tuple(group.inventory for group in discovered_groups)
@@ -768,6 +770,7 @@ class TorchAnalysisRuntime:
             f"no verified ModelSlim post-adapter target mapping for {name}"
             for name in dict.fromkeys(unresolved_fused)
         )
+        self._structural_backend_compilation_blockers = self.backend_compilation_blockers
         self.batch_size = batch_size
         self.max_length = max_length
         self.compute_kl = bool(compute_kl)
@@ -878,6 +881,36 @@ class TorchAnalysisRuntime:
             )
         self._baseline: _ForwardAggregate | None = None
 
+    def plan_compilation_blockers(
+        self,
+        assignments: Mapping[str, PrecisionFormat | str],
+    ) -> tuple[str, ...]:
+        """Return plan-specific blockers, trusting unchanged GLM source domains."""
+
+        if not self.architecture_adapter.adapter_id.startswith("modelslim.glm_moe_dsa/"):
+            return self.backend_compilation_blockers
+        normalized = {
+            group_id: _normalize_precision(precision)
+            for group_id, precision in assignments.items()
+        }
+        changed_domains: list[str] = []
+        for group_id, precision in normalized.items():
+            group = self._group_by_id.get(group_id)
+            if group is None:
+                raise ValueError(f"unknown group ID in compilation plan: {group_id!r}")
+            inventory = group.inventory
+            if inventory.quantization_domain == "independent":
+                continue
+            if inventory.source_precision is None or precision is not inventory.source_precision:
+                changed_domains.append(group_id)
+        if changed_domains:
+            return (
+                *self.backend_compilation_blockers,
+                "plan changes source-YAML protected quantization domains: "
+                + ", ".join(sorted(changed_domains)),
+            )
+        return self._structural_backend_compilation_blockers
+
     @classmethod
     def from_bundle(
         cls,
@@ -942,32 +975,30 @@ class TorchAnalysisRuntime:
         self._assert_context_integrity()
         baseline = self._ensure_baseline()
         measurements: list[InterventionMeasurement] = []
-        total = len(self._runtime_groups) * len(normalized)
-        current = 0
-        for group in self._runtime_groups:
-            for precision in normalized:
-                current += 1
-                if progress_callback is not None:
-                    progress_callback(
-                        "measurement_start",
-                        current,
-                        total,
-                        group.inventory.group_id,
-                        precision.value,
-                    )
-                    self._assert_context_integrity()
-                measurement = self._evaluate_group(group, precision, baseline)
+        measurement_pairs = _supported_measurement_pairs(self._runtime_groups, normalized)
+        total = len(measurement_pairs)
+        for current, (group, precision) in enumerate(measurement_pairs, start=1):
+            if progress_callback is not None:
+                progress_callback(
+                    "measurement_start",
+                    current,
+                    total,
+                    group.inventory.group_id,
+                    precision.value,
+                )
                 self._assert_context_integrity()
-                measurements.append(measurement)
-                if progress_callback is not None:
-                    progress_callback(
-                        "measurement_complete",
-                        current,
-                        total,
-                        group.inventory.group_id,
-                        precision.value,
-                    )
-                    self._assert_context_integrity()
+            measurement = self._evaluate_group(group, precision, baseline)
+            self._assert_context_integrity()
+            measurements.append(measurement)
+            if progress_callback is not None:
+                progress_callback(
+                    "measurement_complete",
+                    current,
+                    total,
+                    group.inventory.group_id,
+                    precision.value,
+                )
+                self._assert_context_integrity()
 
         return AnalysisRunResult(
             groups=self.groups,
@@ -977,8 +1008,10 @@ class TorchAnalysisRuntime:
                 evidence_metric="teacher_forced_delta_nll_per_token",
                 full_model_dataset_passes=(
                     1
-                    + len(self._runtime_groups)
-                    * sum(item is not PrecisionFormat.BF16 for item in normalized)
+                    + sum(
+                        precision is not PrecisionFormat.BF16
+                        for _group, precision in measurement_pairs
+                    )
                     * (2 if self.compute_kl else 1)
                 ),
                 backward_dataset_passes=0,
@@ -1029,16 +1062,21 @@ class TorchAnalysisRuntime:
                 raise TorchAnalysisError(f"fast mode block root disappeared: {block_name!r}")
             bindings.append((group, block))
 
-        total = len(bindings) * len(normalized)
+        measurement_pairs = _supported_measurement_pairs(
+            tuple(group for group, _block in bindings),
+            normalized,
+        )
+        precisions_by_group = {
+            group.inventory.group_id: tuple(
+                precision
+                for candidate_group, precision in measurement_pairs
+                if candidate_group.inventory.group_id == group.inventory.group_id
+            )
+            for group, _block in bindings
+        }
+        total = len(measurement_pairs)
         if progress_callback is not None:
-            for current, (group, precision) in enumerate(
-                (
-                    (group, precision)
-                    for group, _block in bindings
-                    for precision in normalized
-                ),
-                start=1,
-            ):
+            for current, (group, precision) in enumerate(measurement_pairs, start=1):
                 progress_callback(
                     "measurement_start",
                     current,
@@ -1049,8 +1087,7 @@ class TorchAnalysisRuntime:
 
         stats = {
             (group.inventory.group_id, precision): [0.0, 0.0, 0]
-            for group, _block in bindings
-            for precision in normalized
+            for group, precision in measurement_pairs
         }
         replaying: set[int] = set()
         active_mask: Any | None = None
@@ -1118,7 +1155,7 @@ class TorchAnalysisRuntime:
                     identity = id(module)
                     replaying.add(identity)
                     try:
-                        for precision in normalized:
+                        for precision in precisions_by_group[group_id]:
                             if precision is PrecisionFormat.BF16:
                                 selected = self._torch.zeros(
                                     valid_count,
@@ -1213,14 +1250,7 @@ class TorchAnalysisRuntime:
         self._assert_context_integrity()
         self._baseline = _ForwardAggregate(nll_sum, token_count, elapsed)
         measurements: list[ApproximateMeasurement] = []
-        for current, (group, precision) in enumerate(
-            (
-                (group, precision)
-                for group, _block in bindings
-                for precision in normalized
-            ),
-            start=1,
-        ):
+        for current, (group, precision) in enumerate(measurement_pairs, start=1):
             signed_sum, square_sum, count = stats[(group.inventory.group_id, precision)]
             if count != token_count:
                 raise TorchAnalysisError(
@@ -1268,8 +1298,9 @@ class TorchAnalysisRuntime:
                     precision.value,
                 )
 
-        non_reference_precisions = sum(
-            precision is not PrecisionFormat.BF16 for precision in normalized
+        non_reference_pairs = sum(
+            precision is not PrecisionFormat.BF16
+            for _group, precision in measurement_pairs
         )
         return AnalysisRunResult(
             groups=self.groups,
@@ -1280,8 +1311,7 @@ class TorchAnalysisRuntime:
                 full_model_dataset_passes=1,
                 backward_dataset_passes=1,
                 local_block_replays=(
-                    len(bindings)
-                    * non_reference_precisions
+                    non_reference_pairs
                     * ((len(self.samples) + self.batch_size - 1) // self.batch_size)
                 ),
             ),
@@ -2199,14 +2229,49 @@ def _kl_sum(torch: Any, reference_logits: Any, candidate_logits: Any, mask: Any)
 def _apply_capability_constraints(
     groups: Sequence[_RuntimeGroup],
     snapshot: CapabilitySnapshot | None,
+    *,
+    source_precision_by_module: Mapping[str, PrecisionFormat] | None = None,
 ) -> tuple[_RuntimeGroup, ...]:
-    """Bind domain candidates to the backend snapshot, failing closed."""
+    """Bind candidates to backend support while preserving the source YAML anchor."""
 
+    source_precisions = dict(source_precision_by_module or {})
     constrained: list[_RuntimeGroup] = []
     for group in groups:
+        module_anchors = {
+            source_precisions[name]
+            for name in group.inventory.module_names
+            if name in source_precisions
+        }
+        missing_anchors = tuple(
+            name for name in group.inventory.module_names if name not in source_precisions
+        )
+        if module_anchors and missing_anchors:
+            raise DiscoveryError(
+                f"decision group {group.inventory.group_id!r} is only partially covered by "
+                f"recognized source precisions; missing={list(missing_anchors)}"
+            )
+        if len(module_anchors) > 1:
+            values = sorted(item.value for item in module_anchors)
+            raise DiscoveryError(
+                f"decision group {group.inventory.group_id!r} has mixed source precisions "
+                f"{values}; split the architecture decision group before optimization"
+            )
+        source_precision = next(iter(module_anchors), None)
+        inventory = replace(
+            group.inventory,
+            source_precision=source_precision,
+            warnings=(
+                *group.inventory.warnings,
+                *(
+                    (f"source YAML safe anchor={source_precision.value}",)
+                    if source_precision is not None
+                    else ()
+                ),
+            ),
+        )
         domain_id = group.inventory.quantization_domain
         if domain_id == "independent":
-            constrained.append(group)
+            constrained.append(replace(group, inventory=inventory))
             continue
         capability = None
         if snapshot is not None:
@@ -2226,21 +2291,41 @@ def _apply_capability_constraints(
                     )
                 capability = matches[0] if matches else None
         if capability is None or capability.status == "unknown":
-            allowed = (PrecisionFormat.BF16,)
-            warning = (
-                f"{domain_id} capability is unknown; independent quantization is disabled "
-                "and the domain is fixed to BF16"
+            allowed = (
+                (source_precision,)
+                if source_precision is not None
+                else (PrecisionFormat.BF16,)
             )
+            if source_precision is not None:
+                warning = (
+                    f"{domain_id} capability is unknown; candidate changes are disabled "
+                    f"and the domain is fixed to source YAML {source_precision.value}"
+                )
+            else:
+                warning = (
+                    f"{domain_id} capability is unknown and no source precision was "
+                    "recognized; the domain is fixed to BF16"
+                )
         else:
-            allowed = capability.allowed_precisions or (PrecisionFormat.BF16,)
+            declared = capability.allowed_precisions or (PrecisionFormat.BF16,)
+            allowed = tuple(
+                dict.fromkeys(
+                    (*declared, *((source_precision,) if source_precision is not None else ()))
+                )
+            )
             warning = f"domain capability={capability.domain_id}:{capability.status}"
+            if source_precision is not None and source_precision not in declared:
+                warning += (
+                    f"; preserving source YAML safe anchor {source_precision.value} "
+                    "outside the snapshot declaration"
+                )
         constrained.append(
             replace(
                 group,
                 inventory=replace(
-                    group.inventory,
+                    inventory,
                     allowed_formats=allowed,
-                    warnings=(*group.inventory.warnings, warning),
+                    warnings=(*inventory.warnings, warning),
                 ),
             )
         )
@@ -2614,6 +2699,31 @@ def _normalize_precision(value: PrecisionFormat | str) -> PrecisionFormat:
     return normalized
 
 
+def _supported_measurement_pairs(
+    groups: Sequence[_RuntimeGroup],
+    precisions: Sequence[PrecisionFormat],
+) -> tuple[tuple[_RuntimeGroup, PrecisionFormat], ...]:
+    """Prune candidates forbidden by a domain while retaining caller order."""
+
+    pairs: list[tuple[_RuntimeGroup, PrecisionFormat]] = []
+    for group in groups:
+        allowed = group.inventory.allowed_formats
+        selected = tuple(
+            precision
+            for precision in precisions
+            if allowed is None or precision in allowed
+        )
+        if not selected:
+            source = group.inventory.source_precision
+            anchor = source.value if source is not None else "none"
+            raise TorchAnalysisError(
+                f"decision group {group.inventory.group_id!r} has no supported requested "
+                f"precision; source YAML anchor={anchor}"
+            )
+        pairs.extend((group, precision) for precision in selected)
+    return tuple(pairs)
+
+
 def _group_inventory_to_dict(group: GroupInventory) -> dict[str, Any]:
     return {
         "group_id": group.group_id,
@@ -2627,6 +2737,9 @@ def _group_inventory_to_dict(group: GroupInventory) -> dict[str, Any]:
             None
             if group.allowed_formats is None
             else [precision.value for precision in group.allowed_formats]
+        ),
+        "source_precision": (
+            None if group.source_precision is None else group.source_precision.value
         ),
     }
 
