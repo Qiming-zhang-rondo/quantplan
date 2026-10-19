@@ -4,10 +4,12 @@ import pytest
 
 from quantplan.domain import (
     ApproximateMeasurement,
+    DirectionalMeasurement,
     GroupInventory,
     InterventionMeasurement,
     PlanEvaluation,
     PrecisionFormat,
+    StatisticalMeasurement,
 )
 from quantplan.planning import (
     PlanningPolicy,
@@ -118,6 +120,203 @@ def test_candidate_set_uses_fast_risk_without_inventing_delta_nll() -> None:
     w4 = next(item for item in result.evidence if item.precision is PrecisionFormat.W4A8)
     assert w4.risk == pytest.approx(0.125)
     assert not hasattr(measurement, "delta_nll")
+
+
+def test_statistical_risk_is_a_separate_uncalibrated_evidence_family() -> None:
+    inventory = GroupInventory("block_0", ("layers.0.fc",), 100)
+    measurement = StatisticalMeasurement(
+        group_id="block_0",
+        precision=PrecisionFormat.W4A8,
+        context_id="ctx",
+        module_names=inventory.module_names,
+        parameter_count=100,
+        estimated_risk=0.125,
+        token_count=128,
+        elapsed_seconds=1.0,
+        metric_id="stats-v1",
+        weight_risk=0.1,
+        activation_risk=0.025,
+    )
+
+    result = build_candidate_set(
+        (inventory,),
+        (measurement,),
+        allowed_formats=(PrecisionFormat.W4A8,),
+        policy=PlanningPolicy(kl_weight=1.0),
+    )
+
+    w4 = next(item for item in result.evidence if item.precision is PrecisionFormat.W4A8)
+    assert w4.risk == pytest.approx(measurement.estimated_risk)
+    assert any("KL weight ignored" in warning for warning in w4.warnings)
+    assert not hasattr(measurement, "delta_nll")
+    assert not hasattr(measurement, "mean_first_order_effect")
+
+    exact = _measurement(
+        "block_0", PrecisionFormat.W8A8, 2.01, modules=inventory.module_names
+    )
+    replay = ApproximateMeasurement(
+        group_id="block_0",
+        precision=PrecisionFormat.W8A8,
+        context_id="ctx",
+        module_names=inventory.module_names,
+        parameter_count=100,
+        estimated_risk=0.01,
+        token_count=128,
+        elapsed_seconds=1.0,
+        metric_id="fast-v1",
+        mean_first_order_effect=0.0,
+        rms_first_order_effect=0.01,
+    )
+    directional = DirectionalMeasurement(
+        group_id="block_0",
+        precision=PrecisionFormat.W8A8,
+        context_id="ctx",
+        module_names=inventory.module_names,
+        parameter_count=100,
+        estimated_risk=0.01,
+        token_count=128,
+        elapsed_seconds=1.0,
+        metric_id="taylor-v1",
+        mean_first_order_effect=0.01,
+        ranking_offset=0.0,
+    )
+    for other in (exact, replay, directional):
+        with pytest.raises(ValueError, match="measurements cannot be mixed"):
+            build_candidate_set(
+                (inventory,),
+                (measurement, other),
+                allowed_formats=(PrecisionFormat.W4A8, PrecisionFormat.W8A8),
+            )
+
+
+@pytest.mark.parametrize(
+    "family", [ApproximateMeasurement, StatisticalMeasurement, DirectionalMeasurement]
+)
+def test_candidate_set_rejects_different_approximate_metric_versions(family) -> None:
+    inventory = GroupInventory("block_0", ("layers.0.fc",), 100)
+    components = {
+        StatisticalMeasurement: {"weight_risk": 0.1, "activation_risk": 0.025},
+        ApproximateMeasurement: {
+            "mean_first_order_effect": 0.0,
+            "rms_first_order_effect": 0.125,
+        },
+        DirectionalMeasurement: {"mean_first_order_effect": 0.125, "ranking_offset": 0.0},
+    }[family]
+    first = family(
+        group_id="block_0",
+        precision=PrecisionFormat.W4A8,
+        context_id="ctx",
+        module_names=inventory.module_names,
+        parameter_count=100,
+        estimated_risk=0.125,
+        token_count=128,
+        elapsed_seconds=1.0,
+        metric_id="metric-v1",
+        **components,
+    )
+    second = replace(first, precision=PrecisionFormat.W8A8, metric_id="metric-v2")
+
+    with pytest.raises(ValueError, match="different metric_id values cannot be mixed"):
+        build_candidate_set(
+            (inventory,),
+            (first, second),
+            allowed_formats=(PrecisionFormat.W4A8, PrecisionFormat.W8A8),
+        )
+
+
+def _directional_measurement(
+    inventory: GroupInventory,
+    precision: PrecisionFormat,
+    effect: float,
+    offset: float,
+) -> DirectionalMeasurement:
+    return DirectionalMeasurement(
+        group_id=inventory.group_id,
+        precision=precision,
+        context_id="ctx",
+        module_names=inventory.module_names,
+        parameter_count=inventory.parameter_count,
+        estimated_risk=effect + offset,
+        token_count=128,
+        elapsed_seconds=1.0,
+        metric_id="taylor-v1",
+        mean_first_order_effect=effect,
+        ranking_offset=offset,
+    )
+
+
+@pytest.mark.parametrize("explicit_bf16", [False, True])
+def test_directional_offsets_preserve_signed_order_including_bf16(explicit_bf16) -> None:
+    inventories = (
+        GroupInventory("block_0", ("layers.0.fc",), 100),
+        GroupInventory("block_1", ("layers.1.fc",), 100),
+    )
+    signed_effects = {
+        ("block_0", PrecisionFormat.W4A8): -0.1,
+        ("block_0", PrecisionFormat.W8A8): -0.2,
+        ("block_1", PrecisionFormat.W4A8): 0.3,
+        ("block_1", PrecisionFormat.W8A8): 0.1,
+    }
+    offsets = {"block_0": 0.2, "block_1": 0.0}
+    measurements = [
+        _directional_measurement(
+            inventory, precision, signed_effects[inventory.group_id, precision],
+            offsets[inventory.group_id],
+        )
+        for inventory in inventories
+        for precision in (PrecisionFormat.W4A8, PrecisionFormat.W8A8)
+    ]
+    if explicit_bf16:
+        measurements.extend(
+            _directional_measurement(
+                inventory, PrecisionFormat.BF16, 0.0, offsets[inventory.group_id]
+            )
+            for inventory in inventories
+        )
+
+    result = build_candidate_set(
+        inventories,
+        measurements,
+        allowed_formats=(PrecisionFormat.W4A8, PrecisionFormat.W8A8),
+        policy=PlanningPolicy(max_high_precision_fraction=1.0),
+    )
+
+    risks = {(item.group_id, item.precision): item.risk for item in result.evidence}
+    assert risks["block_0", PrecisionFormat.W4A8] == pytest.approx(0.1)
+    assert risks["block_0", PrecisionFormat.W8A8] == pytest.approx(0.0)
+    assert risks["block_0", PrecisionFormat.BF16] == pytest.approx(0.2)
+    assert any(plan.assignments["block_0"] is PrecisionFormat.W8A8 for plan in result.plans)
+    assert all(plan.assignments["block_0"] is not PrecisionFormat.BF16 for plan in result.plans)
+    for plan in result.plans:
+        signed_total = sum(
+            signed_effects.get((group_id, precision), 0.0)
+            for group_id, precision in plan.assignments.items()
+        )
+        assert plan.proposal_score == pytest.approx(signed_total + sum(offsets.values()))
+
+
+def test_directional_measurements_reject_inconsistent_group_offsets() -> None:
+    inventory = GroupInventory("block_0", ("layers.0.fc",), 100)
+    first = _directional_measurement(inventory, PrecisionFormat.W4A8, -0.1, 0.2)
+    second = _directional_measurement(inventory, PrecisionFormat.W8A8, -0.2, 0.3)
+
+    with pytest.raises(ValueError, match="different ranking_offset values"):
+        build_candidate_set(
+            (inventory,),
+            (first, second),
+            allowed_formats=(PrecisionFormat.W4A8, PrecisionFormat.W8A8),
+        )
+
+
+def test_directional_planning_rechecks_corrupt_risk_evidence() -> None:
+    inventory = GroupInventory("block_0", ("layers.0.fc",), 100)
+    measurement = _directional_measurement(inventory, PrecisionFormat.W4A8, -0.1, 0.2)
+    object.__setattr__(measurement, "estimated_risk", 0.3)
+
+    with pytest.raises(ValueError, match="estimated_risk is inconsistent"):
+        build_candidate_set(
+            (inventory,), (measurement,), allowed_formats=(PrecisionFormat.W4A8,)
+        )
 
 
 def test_domain_allowed_formats_filter_unsupported_w4_candidate() -> None:

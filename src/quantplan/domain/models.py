@@ -70,6 +70,13 @@ class CandidateEvidence:
     clipping_rate: float | None = None
     confidence: float | None = None
     warnings: tuple[str, ...] = ()
+    latency_seconds: float | None = None
+    latency_lower_bound: float | None = None
+    latency_upper_bound: float | None = None
+    latency_confidence: float | None = None
+    latency_model: str | None = None
+    latency_components: Mapping[str, float] = field(default_factory=dict)
+    latency_warnings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isfinite(self.risk) or self.risk < 0:
@@ -84,6 +91,34 @@ class CandidateEvidence:
             value = getattr(self, name)
             if value is not None and (not isfinite(value) or not 0 <= value <= 1):
                 raise ValueError(f"{name} must be finite and in [0, 1]")
+        for name in (
+            "latency_seconds",
+            "latency_lower_bound",
+            "latency_upper_bound",
+        ):
+            value = getattr(self, name)
+            if value is not None and (not isfinite(value) or value < 0):
+                raise ValueError(f"{name} must be finite and non-negative")
+        if (
+            self.latency_lower_bound is not None
+            and self.latency_upper_bound is not None
+            and self.latency_lower_bound > self.latency_upper_bound
+        ):
+            raise ValueError("latency_lower_bound must not exceed latency_upper_bound")
+        if self.latency_confidence is not None and (
+            not isfinite(self.latency_confidence)
+            or not 0 <= self.latency_confidence <= 1
+        ):
+            raise ValueError("latency_confidence must be finite and in [0, 1]")
+        if self.latency_model is not None and not self.latency_model.strip():
+            raise ValueError("latency_model must be null or a non-empty string")
+        if not isinstance(self.latency_components, Mapping):
+            raise TypeError("latency_components must be a mapping")
+        for key, value in self.latency_components.items():
+            if not isinstance(key, str) or not key:
+                raise ValueError("latency_components keys must be non-empty strings")
+            if not isfinite(float(value)) or float(value) < 0:
+                raise ValueError("latency_components values must be finite and non-negative")
 
 
 @dataclass(frozen=True)
@@ -99,6 +134,7 @@ class GroupInventory:
     quantization_domain: str = "independent"
     allowed_formats: tuple[PrecisionFormat, ...] | None = None
     source_precision: PrecisionFormat | None = None
+    operator_shapes: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.group_id:
@@ -127,6 +163,21 @@ class GroupInventory:
             self.source_precision, PrecisionFormat
         ):
             raise ValueError("source_precision must be a PrecisionFormat or None")
+        if not isinstance(self.operator_shapes, Mapping):
+            raise TypeError("operator_shapes must be a mapping")
+        for name, shape in self.operator_shapes.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError("operator_shapes keys must be non-empty strings")
+            if not isinstance(shape, Sequence) or isinstance(shape, (str, bytes)):
+                raise TypeError("operator_shapes values must be shape sequences")
+            normalized_shape = tuple(int(dimension) for dimension in shape)
+            if not normalized_shape or any(dimension < 1 for dimension in normalized_shape):
+                raise ValueError("operator_shapes dimensions must be positive")
+        object.__setattr__(
+            self,
+            "operator_shapes",
+            {str(name): tuple(int(dimension) for dimension in shape) for name, shape in self.operator_shapes.items()},
+        )
 
     @property
     def effective_backend_patterns(self) -> tuple[str, ...]:
@@ -222,6 +273,85 @@ class ApproximateMeasurement:
                 raise ValueError(f"{name} must be finite and non-negative")
         if not isfinite(self.mean_first_order_effect):
             raise ValueError("mean_first_order_effect must be finite")
+
+
+@dataclass(frozen=True)
+class StatisticalMeasurement:
+    """No-replay gradient-moment ranking evidence, not Fisher or delta NLL.
+
+    Separate from ApproximateMeasurement: no signed Taylor effect or local
+    candidate output was measured. Components are nonnegative factorized
+    noise energies at the declared quantization boundaries.
+    """
+
+    group_id: str
+    precision: PrecisionFormat
+    context_id: str
+    module_names: tuple[str, ...]
+    parameter_count: int
+    estimated_risk: float
+    token_count: int
+    elapsed_seconds: float
+    metric_id: str
+    weight_risk: float
+    activation_risk: float
+    warnings: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.group_id or not self.context_id or not self.metric_id:
+            raise ValueError("group_id, context_id and metric_id must not be empty")
+        if not self.module_names or self.parameter_count < 1 or self.token_count < 1:
+            raise ValueError("module_names and positive parameter/token counts are required")
+        for name in ("estimated_risk", "weight_risk", "activation_risk", "elapsed_seconds"):
+            value = getattr(self, name)
+            if not isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if not isclose(
+            self.estimated_risk, self.weight_risk + self.activation_risk,
+            rel_tol=1e-9, abs_tol=1e-15,
+        ):
+            raise ValueError("estimated_risk must equal weight_risk + activation_risk")
+
+
+@dataclass(frozen=True)
+class DirectionalMeasurement:
+    """Signed shared-projection Taylor evidence, not observed loss or Fisher.
+
+    A common nonnegative offset for every candidate in a group preserves all
+    within-group differences for the nonnegative-risk solver. Cross-group
+    sensitivity comparisons must use mean_first_order_effect, not shifted risk.
+    """
+
+    group_id: str
+    precision: PrecisionFormat
+    context_id: str
+    module_names: tuple[str, ...]
+    parameter_count: int
+    estimated_risk: float
+    token_count: int
+    elapsed_seconds: float
+    metric_id: str
+    mean_first_order_effect: float
+    ranking_offset: float
+    warnings: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.group_id or not self.context_id or not self.metric_id:
+            raise ValueError("group_id, context_id and metric_id must not be empty")
+        if not self.module_names or self.parameter_count < 1 or self.token_count < 1:
+            raise ValueError("module_names and positive parameter/token counts are required")
+        for name in ("estimated_risk", "ranking_offset", "elapsed_seconds"):
+            if not isfinite(getattr(self, name)) or getattr(self, name) < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if not isfinite(self.mean_first_order_effect):
+            raise ValueError("mean_first_order_effect must be finite")
+        if not isclose(
+            self.estimated_risk, self.mean_first_order_effect + self.ranking_offset,
+            rel_tol=1e-9, abs_tol=1e-15,
+        ):
+            raise ValueError("estimated_risk must equal signed effect plus ranking_offset")
+        if self.precision is PrecisionFormat.BF16 and self.mean_first_order_effect != 0:
+            raise ValueError("BF16 reference signed effect must be zero")
 
 
 @dataclass(frozen=True)

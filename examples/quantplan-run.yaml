@@ -53,6 +53,22 @@ search:
   # Normalized planning proxies, not measured hardware latency or memory.
   costs: {w4a4: 0.75, w4a8: 1.0, w8a8: 1.5, bf16: 2.5}
 
+# Optional fast latency model. Set mode=calibrated and provide a JSON file
+# with schema quantplan.latency-calibration/v1 for sparse operator corrections.
+latency:
+  mode: "off"  # off, static or calibrated
+  deployment_mode: decode_bs1
+  memory_bandwidth_gbps: null
+  compute_tflops: null
+  memory_efficiency: 0.70
+  compute_efficiency: 0.50
+  launch_overhead_us: 2.0
+  qdq_overhead_us: 0.0
+  layout_overhead_us: 0.0
+  fallback_overhead_us: 0.0
+  uncertainty: 0.25
+  calibration_path: null
+
 # Relative paths are confined under output_dir.
 output:
   model_inventory: model-inventory.json
@@ -64,3 +80,4 @@ output:
   diff: plan.diff
   yaml_audit: yaml-audit.json
   run_manifest: run-manifest.json
+  latency_report: latency-report.json

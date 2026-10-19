@@ -6,13 +6,19 @@ from pathlib import Path
 from quantplan.cli import build_parser, main
 
 
-def test_run_mode_defaults_to_exact_and_accepts_fast() -> None:
+def test_run_mode_defaults_to_exact_and_accepts_fast_modes() -> None:
     parser = build_parser()
 
     assert parser.parse_args(["run", "--config", "run.yaml"]).mode == "exact"
     assert parser.parse_args(
         ["run", "--config", "run.yaml", "--mode", "fast"]
     ).mode == "fast"
+    assert parser.parse_args(
+        ["run", "--config", "run.yaml", "--mode", "fast-stats"]
+    ).mode == "fast-stats"
+    assert parser.parse_args(
+        ["run", "--config", "run.yaml", "--mode", "fast-taylor"]
+    ).mode == "fast-taylor"
 
 
 def test_cli_evaluates_ranking(tmp_path: Path, capsys) -> None:

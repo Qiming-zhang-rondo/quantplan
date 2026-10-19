@@ -1,0 +1,7 @@
+{
+  "schema_version": "quantplan.latency-calibration/v1",
+  "entries": {
+    "block_0:dense_mlp|w4a8": 0.000012,
+    "block_0:dense_mlp|w8a8": 0.000018
+  }
+}

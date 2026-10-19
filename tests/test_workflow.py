@@ -10,10 +10,12 @@ from quantplan.adapters.modelslim import inspect_modelslim_yaml
 from quantplan.artifacts import ArtifactError
 from quantplan.domain import (
     ApproximateMeasurement,
+    DirectionalMeasurement,
     GroupInventory,
     InterventionMeasurement,
     PlanEvaluation,
     PrecisionFormat,
+    StatisticalMeasurement,
 )
 from quantplan.run_config import CandidateConfig, loads_run_config
 from quantplan.workflow import execute_workflow
@@ -140,6 +142,105 @@ class _PartialRuntime(_FakeRuntime):
         super().__init__()
         self.discovered_group_count = 40
         self.full_group_coverage = False
+
+
+class _StatsRuntime(_FakeRuntime):
+    def __init__(self, *, fail_all: bool = False) -> None:
+        super().__init__()
+        self.stats_run_called = False
+        self.evaluated_plan_ids = []
+        self.fail_all = fail_all
+
+    def run(self, precisions, *, progress_callback=None):
+        raise AssertionError("fast-stats must not use exact candidate interventions")
+
+    def run_fast(self, precisions, *, progress_callback=None):
+        raise AssertionError("fast-stats must not use local block replay")
+
+    def run_fast_stats(self, precisions, *, progress_callback=None):
+        self.stats_run_called = True
+        measurements = []
+        for group in self.groups:
+            for precision in precisions:
+                risk = {
+                    ("block_0", PrecisionFormat.W4A8): 0.2,
+                    ("block_0", PrecisionFormat.W8A8): 0.01,
+                    ("block_1", PrecisionFormat.W4A8): 0.02,
+                    ("block_1", PrecisionFormat.W8A8): 0.01,
+                }[(group.group_id, precision)]
+                measurements.append(
+                    StatisticalMeasurement(
+                        group_id=group.group_id,
+                        precision=precision,
+                        context_id="toy-context",
+                        module_names=group.module_names,
+                        parameter_count=group.parameter_count,
+                        estimated_risk=risk,
+                        token_count=64,
+                        elapsed_seconds=0.1,
+                        metric_id="stats-v1",
+                        weight_risk=risk * 0.75,
+                        activation_risk=risk * 0.25,
+                    )
+                )
+        return SimpleNamespace(
+            groups=self.groups,
+            module_inventory=self.module_inventory,
+            measurements=tuple(measurements),
+            provenance={"runtime": "toy-stats", "dataset_sha256": "a" * 64},
+        )
+
+    def evaluate_plan(self, assignments, *, plan_id):
+        self.evaluated_plan_ids.append(plan_id)
+        evaluation = super().evaluate_plan(assignments, plan_id=plan_id)
+        if self.fail_all:
+            return replace(evaluation, candidate_nll=2.10)
+        return evaluation
+
+
+class _TaylorRuntime(_StatsRuntime):
+    def __init__(self, *, fail_all: bool = False) -> None:
+        super().__init__(fail_all=fail_all)
+        self.taylor_run_called = False
+
+    def run_fast_stats(self, precisions, *, progress_callback=None):
+        raise AssertionError("fast-taylor must not use statistical candidate scores")
+
+    def run_fast_taylor(self, precisions, *, progress_callback=None):
+        self.taylor_run_called = True
+        effects = {
+            ("block_0", PrecisionFormat.W4A8): 0.2,
+            ("block_0", PrecisionFormat.W8A8): -0.01,
+            ("block_1", PrecisionFormat.W4A8): 0.02,
+            ("block_1", PrecisionFormat.W8A8): 0.01,
+        }
+        offsets = {"block_0": 0.01, "block_1": 0.0}
+        measurements = []
+        for group in self.groups:
+            for precision in (*precisions, PrecisionFormat.BF16):
+                effect = effects.get((group.group_id, precision), 0.0)
+                offset = offsets[group.group_id]
+                measurements.append(
+                    DirectionalMeasurement(
+                        group_id=group.group_id,
+                        precision=precision,
+                        context_id="toy-context",
+                        module_names=group.module_names,
+                        parameter_count=group.parameter_count,
+                        estimated_risk=effect + offset,
+                        token_count=64,
+                        elapsed_seconds=0.1,
+                        metric_id="taylor-v1",
+                        mean_first_order_effect=effect,
+                        ranking_offset=offset,
+                    )
+                )
+        return SimpleNamespace(
+            groups=self.groups,
+            module_inventory=self.module_inventory,
+            measurements=tuple(measurements),
+            provenance={"runtime": "toy-taylor", "dataset_sha256": "a" * 64},
+        )
 
 
 class _BackendBlockedRuntime(_FakeRuntime):
@@ -271,6 +372,113 @@ def test_fast_workflow_uses_approximate_ranking_then_exact_validation(
     report = json.loads((output / "validation-report.json").read_text(encoding="utf-8"))
     assert report["analysis_mode"] == "fast"
     assert report["validation_cap"] == 3
+
+
+@pytest.mark.parametrize("fail_all", [False, True])
+@pytest.mark.parametrize("analysis_mode", ["fast-stats", "fast-taylor"])
+def test_experimental_fast_workflow_validates_cheapest_first_and_stops_on_pass(
+    tmp_path: Path, fail_all: bool, analysis_mode: str
+) -> None:
+    config, output = _make_config(tmp_path)
+    config = replace(
+        config,
+        search=replace(config.search, high_precision_fraction=1.0),
+    )
+    runtime_type = _StatsRuntime if analysis_mode == "fast-stats" else _TaylorRuntime
+    runtime = runtime_type(fail_all=fail_all)
+
+    result = execute_workflow(config, runtime, analysis_mode=analysis_mode)
+
+    if analysis_mode == "fast-stats":
+        assert runtime.stats_run_called
+    else:
+        assert runtime.taylor_run_called
+        assert not runtime.stats_run_called
+    candidates = json.loads((output / "candidate-plan.json").read_text(encoding="utf-8"))
+    ordered = sorted(
+        candidates["plans"],
+        key=lambda item: (item["estimated_cost"], item["proposal_score"]),
+    )
+    assert len(ordered) > 3
+    expected_count = 3 if fail_all else 2
+    assert runtime.evaluated_plan_ids == [item["plan_id"] for item in ordered[:expected_count]]
+    evidence_role = (
+        "factorized gradient statistics; no block replay"
+        if analysis_mode == "fast-stats"
+        else (
+            "shared projection signed first-order; one extra local gradient projection per Linear/batch "
+            "(possibly multiple chunk GEMMs), "
+            "no candidate affine/block replay"
+        )
+    )
+    assert evidence_role in candidates["claim"]
+    evidence = [
+        json.loads(line)
+        for line in (output / "risk-evidence.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert all(item["evidence_role"] == evidence_role for item in evidence)
+    assert all("delta_nll" not in item for item in evidence)
+    if analysis_mode == "fast-stats":
+        assert all("weight_risk" in item and "activation_risk" in item for item in evidence)
+        assert all("mean_first_order_effect" not in item for item in evidence)
+    else:
+        assert all("mean_first_order_effect" in item and "ranking_offset" in item for item in evidence)
+        assert any(item["mean_first_order_effect"] < 0 for item in evidence)
+        assert any(item["precision"] == "bf16" for item in evidence)
+    report = json.loads((output / "validation-report.json").read_text(encoding="utf-8"))
+    assert report["analysis_mode"] == analysis_mode
+    assert report["validation_cap"] == 3
+    assert report["early_stop_on_pass"] is True
+    assert len(report["evaluations"]) == expected_count
+    assert report["passed"] is not fail_all
+    if fail_all:
+        assert result.status == "plan_validation_failed"
+        assert result.derived_yaml is None
+        assert not (output / "derived-modelslim.yaml").exists()
+    else:
+        assert result.status == "complete_analysis_only"
+        assert result.selected_plan_id == ordered[1]["plan_id"]
+        assert result.derived_yaml.is_file()
+
+
+def test_fast_mode_keeps_validating_after_first_passing_plan(tmp_path: Path) -> None:
+    config, output = _make_config(tmp_path)
+    config = replace(config, search=replace(config.search, high_precision_fraction=1.0))
+    runtime = _FastRuntime()
+
+    result = execute_workflow(config, runtime, analysis_mode="fast")
+
+    assert result.status == "complete_analysis_only"
+    assert len(runtime.evaluated_plan_ids) == 3
+    report = json.loads((output / "validation-report.json").read_text(encoding="utf-8"))
+    assert report["evaluations"][1]["delta_nll"] <= config.search.max_delta_nll
+    assert report["early_stop_on_pass"] is False
+
+
+def test_workflow_emits_latency_report_and_uses_static_costs(tmp_path: Path) -> None:
+    config, output = _make_config(tmp_path)
+    config = replace(
+        config,
+        latency=replace(
+            config.latency,
+            mode="static",
+            memory_bandwidth_gbps=1000.0,
+            compute_tflops=100.0,
+        ),
+    )
+
+    result = execute_workflow(config, _FakeRuntime(), analysis_mode="exact")
+
+    assert result.status == "complete_analysis_only"
+    latency_report = json.loads(
+        (output / "latency-report.json").read_text(encoding="utf-8")
+    )
+    assert latency_report["provider"]["mode"] == "static"
+    candidate_plan = json.loads(
+        (output / "candidate-plan.json").read_text(encoding="utf-8")
+    )
+    assert candidate_plan["latency_model"]["mode"] == "static"
+    assert all(item["latency_seconds"] is not None for item in candidate_plan["evidence"])
 
 
 def test_provenance_binds_selection_validation_config_and_dataset(

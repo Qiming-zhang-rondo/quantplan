@@ -12,12 +12,15 @@ from quantplan.domain import (
     ApproximateMeasurement,
     CandidateEvidence,
     DecisionGroup,
+    DirectionalMeasurement,
     GroupInventory,
     InterventionMeasurement,
     PlanEvaluation,
     PrecisionFormat,
     QuantPlan,
+    StatisticalMeasurement,
 )
+from quantplan.latency import LatencyProvider
 from quantplan.search import RiskGuidedSearch, SearchPolicy
 
 DEFAULT_RELATIVE_COSTS: Mapping[PrecisionFormat, float] = {
@@ -62,11 +65,17 @@ class CandidateSet:
 
 def build_candidate_set(
     inventories: Sequence[GroupInventory],
-    measurements: Iterable[InterventionMeasurement | ApproximateMeasurement],
+    measurements: Iterable[
+        InterventionMeasurement
+        | ApproximateMeasurement
+        | StatisticalMeasurement
+        | DirectionalMeasurement
+    ],
     *,
     allowed_formats: Sequence[PrecisionFormat],
     policy: PlanningPolicy | None = None,
     relative_costs: Mapping[PrecisionFormat, float] = DEFAULT_RELATIVE_COSTS,
+    latency_provider: LatencyProvider | None = None,
 ) -> CandidateSet:
     """Build cost-bounded plans from one homogeneous evidence family.
 
@@ -94,7 +103,9 @@ def build_candidate_set(
     context_id = next(iter(context_ids))
     evidence_types = {type(item) for item in measured}
     if len(evidence_types) != 1:
-        raise ValueError("exact and approximate measurements cannot be mixed")
+        raise ValueError(
+            "exact, local-replay, statistical and directional measurements cannot be mixed"
+        )
     token_count = measured[0].token_count
     if isinstance(measured[0], InterventionMeasurement):
         baseline_nll = measured[0].baseline_nll
@@ -104,6 +115,16 @@ def build_candidate_set(
                 raise ValueError(
                     "measurements with the same context_id have different baseline NLL values"
                 )
+    else:
+        metric_id = measured[0].metric_id
+        for item in measured[1:]:
+            assert isinstance(
+                item, (ApproximateMeasurement, StatisticalMeasurement, DirectionalMeasurement)
+            )
+            if item.metric_id != metric_id:
+                raise ValueError(
+                    "approximate measurements with different metric_id values cannot be mixed"
+                )
     for item in measured[1:]:
         if item.token_count != token_count:
             raise ValueError(
@@ -111,8 +132,13 @@ def build_candidate_set(
             )
 
     by_key: dict[
-        tuple[str, PrecisionFormat], InterventionMeasurement | ApproximateMeasurement
+        tuple[str, PrecisionFormat],
+        InterventionMeasurement
+        | ApproximateMeasurement
+        | StatisticalMeasurement
+        | DirectionalMeasurement,
     ] = {}
+    ranking_offsets: dict[str, float] = {}
     evidence: list[CandidateEvidence] = []
     for item in measured:
         inventory = inventory_by_id.get(item.group_id)
@@ -148,15 +174,36 @@ def build_candidate_set(
             if policy.kl_weight:
                 warnings.append("KL weight ignored for approximate fast evidence")
             risk = item.estimated_risk
+            if isinstance(item, DirectionalMeasurement):
+                warnings.append(
+                    "directional risk includes a per-group offset for planning; "
+                    "cross-group sensitivity ranking must use mean_first_order_effect"
+                )
+                offset = ranking_offsets.setdefault(item.group_id, item.ranking_offset)
+                if not isclose(item.ranking_offset, offset, rel_tol=0.0, abs_tol=1e-12):
+                    raise ValueError(
+                        f"directional measurements for {item.group_id!r} have "
+                        "different ranking_offset values"
+                    )
+                if not isclose(
+                    risk, item.mean_first_order_effect + offset, rel_tol=1e-9, abs_tol=1e-12
+                ):
+                    raise ValueError(
+                        f"directional estimated_risk is inconsistent with the signed effect "
+                        f"and shared ranking_offset for {item.group_id!r}"
+                    )
+                if item.precision is PrecisionFormat.BF16 and not isclose(
+                    item.mean_first_order_effect, 0.0, rel_tol=0.0, abs_tol=1e-12
+                ):
+                    raise ValueError("directional BF16 reference must have zero signed effect")
         evidence.append(
-            CandidateEvidence(
-                group_id=item.group_id,
-                precision=item.precision,
+            _candidate_evidence(
+                item,
+                inventory,
                 context_id=context_id,
                 risk=risk,
-                estimated_cost=(
-                    item.parameter_count * float(relative_costs[item.precision])
-                ),
+                relative_costs=relative_costs,
+                latency_provider=latency_provider,
                 warnings=tuple(warnings),
             )
         )
@@ -188,16 +235,21 @@ def build_candidate_set(
             and (inventory.group_id, PrecisionFormat.BF16) not in by_key
         ):
             evidence.append(
-                CandidateEvidence(
-                    group_id=inventory.group_id,
-                    precision=PrecisionFormat.BF16,
+                _candidate_evidence(
+                    None,
+                    inventory,
                     context_id=context_id,
-                    risk=0.0,
-                    estimated_cost=(
-                        inventory.parameter_count
-                        * float(relative_costs[PrecisionFormat.BF16])
+                    risk=ranking_offsets.get(inventory.group_id, 0.0),
+                    relative_costs=relative_costs,
+                    latency_provider=latency_provider,
+                    warnings=(
+                        "BF16 anchor synthesized from the shared baseline",
+                        *(
+                            ("directional BF16 risk includes the shared group ranking_offset",)
+                            if inventory.group_id in ranking_offsets
+                            else ()
+                        ),
                     ),
-                    warnings=("BF16 anchor synthesized from the shared baseline",),
                 )
             )
 
@@ -222,22 +274,25 @@ def build_candidate_set(
         for group in groups
     )
 
+    evidence_by_key = {(item.group_id, item.precision): item for item in evidence}
     base_cost = sum(
-        inventory.parameter_count
-        * float(
-            relative_costs[
+        evidence_by_key[
+            (
+                inventory.group_id,
                 (
                     policy.base_precision
                     if group.allowed_formats and policy.base_precision in group.allowed_formats
                     else _cheapest_allowed_format(group, relative_costs)
-                )
-            ]
-        )
+                ),
+            )
+        ].estimated_cost
         for inventory, group in zip(inventories, groups, strict=True)
     )
     ceiling_cost = sum(
-        inventory.parameter_count
-        * max(float(relative_costs[item]) for item in group.allowed_formats)
+        max(
+            evidence_by_key[(inventory.group_id, item)].estimated_cost
+            for item in group.allowed_formats
+        )
         for inventory, group in zip(inventories, groups, strict=True)
     )
     max_cost = base_cost + policy.max_high_precision_fraction * (
@@ -337,6 +392,52 @@ def _inventory_formats(
     if inventory.allowed_formats is None and PrecisionFormat.BF16 not in allowed:
         allowed += (PrecisionFormat.BF16,)
     return allowed
+
+
+def _candidate_evidence(
+    measurement: (
+        InterventionMeasurement
+        | ApproximateMeasurement
+        | StatisticalMeasurement
+        | DirectionalMeasurement
+        | None
+    ),
+    inventory: GroupInventory,
+    *,
+    context_id: str,
+    risk: float,
+    relative_costs: Mapping[PrecisionFormat, float],
+    latency_provider: LatencyProvider | None,
+    warnings: tuple[str, ...],
+) -> CandidateEvidence:
+    precision = (
+        measurement.precision if measurement is not None else PrecisionFormat.BF16
+    )
+    latency = (
+        latency_provider.estimate(inventory, precision)
+        if latency_provider is not None
+        else None
+    )
+    all_warnings = (*warnings, *(latency.warnings if latency is not None else ()))
+    return CandidateEvidence(
+        group_id=inventory.group_id,
+        precision=precision,
+        context_id=context_id,
+        risk=risk,
+        estimated_cost=(
+            latency.seconds
+            if latency is not None
+            else inventory.parameter_count * float(relative_costs[precision])
+        ),
+        warnings=all_warnings,
+        latency_seconds=latency.seconds if latency is not None else None,
+        latency_lower_bound=latency.lower_bound if latency is not None else None,
+        latency_upper_bound=latency.upper_bound if latency is not None else None,
+        latency_confidence=latency.confidence if latency is not None else None,
+        latency_model=latency.model if latency is not None else None,
+        latency_components=dict(latency.components) if latency is not None else {},
+        latency_warnings=latency.warnings if latency is not None else (),
+    )
 
 
 def _cheapest_allowed_format(

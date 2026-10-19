@@ -1,0 +1,1615 @@
+{
+  "schema": "quantplan.linear-taylor-probe-summary/v1",
+  "source_schema": "quantplan.linear-taylor-probe/v1",
+  "platform": "macOS-14.6-arm64-arm-64bit",
+  "python_version": "3.12.5",
+  "torch_version": "2.13.0",
+  "devices": [
+    "cpu"
+  ],
+  "arguments": {
+    "output": "experiments/results/linear-taylor-probe.json",
+    "seeds": [
+      7,
+      17,
+      29
+    ],
+    "training_steps": [
+      0,
+      200
+    ],
+    "repeats": 3,
+    "layers": 6,
+    "width": 32,
+    "without_attention": false,
+    "token_chunk": 256,
+    "weight_chunk": 256
+  },
+  "median_seconds": {
+    "0": {
+      "run": 0.037076749838888645,
+      "run_fast": 0.021657833131030202,
+      "run_fast_stats": 0.019839624874293804,
+      "run_linear_taylor": 0.018701666966080666
+    },
+    "200": {
+      "run": 0.03746312507428229,
+      "run_fast": 0.021621499909088016,
+      "run_fast_stats": 0.019945875043049455,
+      "run_linear_taylor": 0.0191147078294307
+    }
+  },
+  "notes": [
+    "Prototype only, not connected to the production solver.",
+    "One full F+B per batch; local Linear candidate matmuls still scale with candidates.",
+    "Baseline boundary input/output references stay live until their backward hook.",
+    "No model weight gradients or candidate full-model/backward/block replays.",
+    "The first-order signed score can be negative; clipping creates ties.",
+    "abs(mean)+RMS is diagnostic, without a fitted mixing coefficient.",
+    "3 fixed seeds, optional tiny fitting uses calibration texts; no pretrained LLM claim.",
+    "One warmup dataset pass per model and full-plan checks are outside analysis timing."
+  ],
+  "full_report_path": "/private/tmp/quantplan-probe-full-reports.JDeIVP/linear-taylor-probe.json",
+  "full_report_sha256": "64a8b07b195a718235b3f0253a0e833800cf4552e746832cd0a491e7ea9263ab",
+  "full_report_bytes": 1286111,
+  "reproduction_command": ".venv/bin/python experiments/probe_linear_taylor.py --output /tmp/linear-taylor-probe-reproduced.json --seeds 7 17 29 --training-steps 0 200 --repeats 3 --layers 6 --width 32 --token-chunk 256 --weight-chunk 256",
+  "seeds": [
+    {
+      "seed": 7,
+      "training_steps": 0,
+      "repeat_count": 3,
+      "quality_identical_across_repeats": true,
+      "counts_identical_across_repeats": true,
+      "training": {
+        "steps": 0,
+        "seconds": 0.0
+      },
+      "ranking": {
+        "fast": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": -0.9428571428571428,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.42857142857142855,
+            "positive_harm_top_k_recall": 0.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 3,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": -0.7714285714285715,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.08571428571428572,
+            "positive_harm_top_k_recall": 0.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 4,
+            "top_k": 2
+          }
+        },
+        "stats": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": -0.8285714285714286,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.37142857142857144,
+            "positive_harm_top_k_recall": 0.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 3,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": -0.8285714285714286,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.02857142857142857,
+            "positive_harm_top_k_recall": 0.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 4,
+            "top_k": 2
+          }
+        },
+        "linear_signed": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.8285714285714286,
+            "spearman_absolute_delta_nll_diagnostic_only": -0.7714285714285715,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 3,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.7142857142857143,
+            "spearman_absolute_delta_nll_diagnostic_only": -0.14285714285714285,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 4,
+            "top_k": 2
+          }
+        },
+        "linear_clipped": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.3927922024247863,
+            "spearman_absolute_delta_nll_diagnostic_only": -0.3927922024247863,
+            "positive_harm_top_k_recall": 1.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 3,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.3718678720805473,
+            "spearman_absolute_delta_nll_diagnostic_only": -0.033806170189140665,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 4,
+            "top_k": 2
+          }
+        },
+        "linear_abs_rms_diagnostic": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": -0.8285714285714286,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.37142857142857144,
+            "positive_harm_top_k_recall": 0.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 3,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": -0.7142857142857143,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.14285714285714285,
+            "positive_harm_top_k_recall": 0.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 4,
+            "top_k": 2
+          }
+        }
+      },
+      "plans": {
+        "exact": {
+          "assignments": {
+            "layers.0": "bf16",
+            "layers.1": "bf16",
+            "layers.2": "w4a8",
+            "layers.3": "w4a8",
+            "layers.4": "bf16",
+            "layers.5": "w4a8"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 4.351646992697645,
+          "candidate_nll": 4.348446974113806,
+          "delta_nll": -0.003200018583839004,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "fast": {
+          "assignments": {
+            "layers.0": "w4a8",
+            "layers.1": "w4a8",
+            "layers.2": "bf16",
+            "layers.3": "bf16",
+            "layers.4": "w4a8",
+            "layers.5": "bf16"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 4.351646992697645,
+          "candidate_nll": 4.3524503565546295,
+          "delta_nll": 0.0008033638569848733,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "stats": {
+          "assignments": {
+            "layers.0": "w4a8",
+            "layers.1": "bf16",
+            "layers.2": "bf16",
+            "layers.3": "bf16",
+            "layers.4": "w4a8",
+            "layers.5": "w4a8"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 4.351646992697645,
+          "candidate_nll": 4.35119606131938,
+          "delta_nll": -0.00045093137826501817,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "linear_signed": {
+          "assignments": {
+            "layers.0": "bf16",
+            "layers.1": "bf16",
+            "layers.2": "w4a8",
+            "layers.3": "w4a8",
+            "layers.4": "bf16",
+            "layers.5": "w4a8"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 4.351646992697645,
+          "candidate_nll": 4.348446974113806,
+          "delta_nll": -0.003200018583839004,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "linear_clipped": {
+          "assignments": {
+            "layers.0": "w4a8",
+            "layers.1": "bf16",
+            "layers.2": "w4a8",
+            "layers.3": "w4a8",
+            "layers.4": "bf16",
+            "layers.5": "bf16"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 4.351646992697645,
+          "candidate_nll": 4.3494195511092,
+          "delta_nll": -0.0022274415884444565,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "linear_abs_rms_diagnostic": {
+          "assignments": {
+            "layers.0": "w4a8",
+            "layers.1": "bf16",
+            "layers.2": "bf16",
+            "layers.3": "bf16",
+            "layers.4": "w4a8",
+            "layers.5": "w4a8"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 4.351646992697645,
+          "candidate_nll": 4.35119606131938,
+          "delta_nll": -0.00045093137826501817,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        }
+      },
+      "actual_counts": {
+        "run": {
+          "full_forwards": 26,
+          "backwards": 0,
+          "block_forwards": 156
+        },
+        "run_fast": {
+          "full_forwards": 2,
+          "backwards": 2,
+          "block_forwards": 36
+        },
+        "run_fast_stats": {
+          "full_forwards": 2,
+          "backwards": 2,
+          "block_forwards": 12
+        },
+        "run_linear_taylor": {
+          "full_forwards": 2,
+          "backwards": 2,
+          "block_forwards": 12,
+          "local_linear_candidates": 168,
+          "local_linear_chunk_matmuls": 168,
+          "local_block_replays": 0
+        }
+      },
+      "analysis_seconds_by_repeat": {
+        "run": [
+          0.04268033290281892,
+          0.03802550002001226,
+          0.03748275013640523
+        ],
+        "run_fast": [
+          0.055488415993750095,
+          0.02120858314447105,
+          0.021667166845872998
+        ],
+        "run_fast_stats": [
+          0.02216974995099008,
+          0.019839624874293804,
+          0.019471416948363185
+        ],
+        "run_linear_taylor": [
+          0.01946199988014996,
+          0.018947375006973743,
+          0.01869341591373086
+        ]
+      }
+    },
+    {
+      "seed": 17,
+      "training_steps": 0,
+      "repeat_count": 3,
+      "quality_identical_across_repeats": true,
+      "counts_identical_across_repeats": true,
+      "training": {
+        "steps": 0,
+        "seconds": 0.0
+      },
+      "ranking": {
+        "fast": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.08571428571428572,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.7714285714285715,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 3,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.08571428571428572,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.6571428571428571,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 2,
+            "top_k": 2
+          }
+        },
+        "stats": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": -0.14285714285714285,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.6571428571428571,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 3,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.08571428571428572,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.6571428571428571,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 2,
+            "top_k": 2
+          }
+        },
+        "linear_signed": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.9428571428571428,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.08571428571428572,
+            "positive_harm_top_k_recall": 1.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 3,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": -0.14285714285714285,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.9428571428571428,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 2,
+            "top_k": 2
+          }
+        },
+        "linear_clipped": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.898645105261295,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.23190841426097938,
+            "positive_harm_top_k_recall": 1.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 3,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": -0.14285714285714285,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.9428571428571428,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 2,
+            "top_k": 2
+          }
+        },
+        "linear_abs_rms_diagnostic": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.08571428571428572,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.7714285714285715,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 3,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.08571428571428572,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.6571428571428571,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 2,
+            "top_k": 2
+          }
+        }
+      },
+      "plans": {
+        "exact": {
+          "assignments": {
+            "layers.0": "w4a8",
+            "layers.1": "w4a8",
+            "layers.2": "bf16",
+            "layers.3": "w4a8",
+            "layers.4": "bf16",
+            "layers.5": "bf16"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 4.392016965951493,
+          "candidate_nll": 4.389799203445662,
+          "delta_nll": -0.0022177625058308337,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "fast": {
+          "assignments": {
+            "layers.0": "w4a8",
+            "layers.1": "w4a8",
+            "layers.2": "bf16",
+            "layers.3": "bf16",
+            "layers.4": "w4a8",
+            "layers.5": "bf16"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 4.392016965951493,
+          "candidate_nll": 4.391909812813375,
+          "delta_nll": -0.0001071531381180435,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "stats": {
+          "assignments": {
+            "layers.0": "w4a8",
+            "layers.1": "bf16",
+            "layers.2": "bf16",
+            "layers.3": "bf16",
+            "layers.4": "w4a8",
+            "layers.5": "w4a8"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 4.392016965951493,
+          "candidate_nll": 4.393821602437034,
+          "delta_nll": 0.0018046364855406338,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "linear_signed": {
+          "assignments": {
+            "layers.0": "w4a8",
+            "layers.1": "w4a8",
+            "layers.2": "bf16",
+            "layers.3": "w4a8",
+            "layers.4": "bf16",
+            "layers.5": "bf16"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 4.392016965951493,
+          "candidate_nll": 4.389799203445662,
+          "delta_nll": -0.0022177625058308337,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "linear_clipped": {
+          "assignments": {
+            "layers.0": "w4a8",
+            "layers.1": "w4a8",
+            "layers.2": "bf16",
+            "layers.3": "w4a8",
+            "layers.4": "bf16",
+            "layers.5": "bf16"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 4.392016965951493,
+          "candidate_nll": 4.389799203445662,
+          "delta_nll": -0.0022177625058308337,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "linear_abs_rms_diagnostic": {
+          "assignments": {
+            "layers.0": "w4a8",
+            "layers.1": "w4a8",
+            "layers.2": "bf16",
+            "layers.3": "bf16",
+            "layers.4": "w4a8",
+            "layers.5": "bf16"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 4.392016965951493,
+          "candidate_nll": 4.391909812813375,
+          "delta_nll": -0.0001071531381180435,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        }
+      },
+      "actual_counts": {
+        "run_fast": {
+          "full_forwards": 2,
+          "backwards": 2,
+          "block_forwards": 36
+        },
+        "run_fast_stats": {
+          "full_forwards": 2,
+          "backwards": 2,
+          "block_forwards": 12
+        },
+        "run_linear_taylor": {
+          "full_forwards": 2,
+          "backwards": 2,
+          "block_forwards": 12,
+          "local_linear_candidates": 168,
+          "local_linear_chunk_matmuls": 168,
+          "local_block_replays": 0
+        },
+        "run": {
+          "full_forwards": 26,
+          "backwards": 0,
+          "block_forwards": 156
+        }
+      },
+      "analysis_seconds_by_repeat": {
+        "run_fast": [
+          0.021415499970316887,
+          0.022104207891970873,
+          0.022093917010352015
+        ],
+        "run_fast_stats": [
+          0.01987520814873278,
+          0.019812083104625344,
+          0.02003595815040171
+        ],
+        "run_linear_taylor": [
+          0.019228541059419513,
+          0.018760666949674487,
+          0.018701666966080666
+        ],
+        "run": [
+          0.03722829185426235,
+          0.036706707905977964,
+          0.03636079118587077
+        ]
+      }
+    },
+    {
+      "seed": 29,
+      "training_steps": 0,
+      "repeat_count": 3,
+      "quality_identical_across_repeats": true,
+      "counts_identical_across_repeats": true,
+      "training": {
+        "steps": 0,
+        "seconds": 0.0
+      },
+      "ranking": {
+        "fast": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": -0.7714285714285715,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.9428571428571428,
+            "positive_harm_top_k_recall": 0.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 2,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.08571428571428572,
+            "spearman_absolute_delta_nll_diagnostic_only": -0.08571428571428572,
+            "positive_harm_top_k_recall": 0.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 4,
+            "top_k": 2
+          }
+        },
+        "stats": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": -0.4857142857142857,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.7714285714285715,
+            "positive_harm_top_k_recall": 0.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 2,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": -0.14285714285714285,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.02857142857142857,
+            "positive_harm_top_k_recall": 0.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 4,
+            "top_k": 2
+          }
+        },
+        "linear_signed": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.9428571428571428,
+            "spearman_absolute_delta_nll_diagnostic_only": -0.7714285714285715,
+            "positive_harm_top_k_recall": 1.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 2,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.37142857142857144,
+            "spearman_absolute_delta_nll_diagnostic_only": -0.14285714285714285,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 4,
+            "top_k": 2
+          }
+        },
+        "linear_clipped": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.8451542547285166,
+            "spearman_absolute_delta_nll_diagnostic_only": -0.5408987230262506,
+            "positive_harm_top_k_recall": 1.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 2,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.2125118592516207,
+            "spearman_absolute_delta_nll_diagnostic_only": -0.33394720739540396,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 4,
+            "top_k": 2
+          }
+        },
+        "linear_abs_rms_diagnostic": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": -0.7714285714285715,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.9428571428571428,
+            "positive_harm_top_k_recall": 0.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 2,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": -0.14285714285714285,
+            "spearman_absolute_delta_nll_diagnostic_only": -0.3142857142857143,
+            "positive_harm_top_k_recall": 0.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 4,
+            "top_k": 2
+          }
+        }
+      },
+      "plans": {
+        "exact": {
+          "assignments": {
+            "layers.0": "bf16",
+            "layers.1": "bf16",
+            "layers.2": "w4a8",
+            "layers.3": "w4a8",
+            "layers.4": "bf16",
+            "layers.5": "w4a8"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 4.343371490934002,
+          "candidate_nll": 4.338282457038538,
+          "delta_nll": -0.005089033895464112,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "fast": {
+          "assignments": {
+            "layers.0": "w4a8",
+            "layers.1": "w4a8",
+            "layers.2": "bf16",
+            "layers.3": "bf16",
+            "layers.4": "w4a8",
+            "layers.5": "bf16"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 4.343371490934002,
+          "candidate_nll": 4.343028395923216,
+          "delta_nll": -0.00034309501078588767,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "stats": {
+          "assignments": {
+            "layers.0": "w4a8",
+            "layers.1": "bf16",
+            "layers.2": "bf16",
+            "layers.3": "bf16",
+            "layers.4": "w4a8",
+            "layers.5": "w4a8"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 4.343371490934002,
+          "candidate_nll": 4.34187840703708,
+          "delta_nll": -0.0014930838969222648,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "linear_signed": {
+          "assignments": {
+            "layers.0": "bf16",
+            "layers.1": "bf16",
+            "layers.2": "w4a8",
+            "layers.3": "w4a8",
+            "layers.4": "bf16",
+            "layers.5": "w4a8"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 4.343371490934002,
+          "candidate_nll": 4.338282457038538,
+          "delta_nll": -0.005089033895464112,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "linear_clipped": {
+          "assignments": {
+            "layers.0": "bf16",
+            "layers.1": "bf16",
+            "layers.2": "w4a8",
+            "layers.3": "w4a8",
+            "layers.4": "w4a8",
+            "layers.5": "bf16"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 4.343371490934002,
+          "candidate_nll": 4.338597881260203,
+          "delta_nll": -0.004773609673799584,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "linear_abs_rms_diagnostic": {
+          "assignments": {
+            "layers.0": "w4a8",
+            "layers.1": "w4a8",
+            "layers.2": "bf16",
+            "layers.3": "bf16",
+            "layers.4": "w4a8",
+            "layers.5": "bf16"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 4.343371490934002,
+          "candidate_nll": 4.343028395923216,
+          "delta_nll": -0.00034309501078588767,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        }
+      },
+      "actual_counts": {
+        "run_fast_stats": {
+          "full_forwards": 2,
+          "backwards": 2,
+          "block_forwards": 12
+        },
+        "run_linear_taylor": {
+          "full_forwards": 2,
+          "backwards": 2,
+          "block_forwards": 12,
+          "local_linear_candidates": 168,
+          "local_linear_chunk_matmuls": 168,
+          "local_block_replays": 0
+        },
+        "run": {
+          "full_forwards": 26,
+          "backwards": 0,
+          "block_forwards": 156
+        },
+        "run_fast": {
+          "full_forwards": 2,
+          "backwards": 2,
+          "block_forwards": 36
+        }
+      },
+      "analysis_seconds_by_repeat": {
+        "run_fast_stats": [
+          0.019869416020810604,
+          0.019323958083987236,
+          0.01982758310623467
+        ],
+        "run_linear_taylor": [
+          0.018201541155576706,
+          0.018401708221063018,
+          0.01866649999283254
+        ],
+        "run": [
+          0.037076749838888645,
+          0.03651525010354817,
+          0.03664037515409291
+        ],
+        "run_fast": [
+          0.020746417110785842,
+          0.021154416957870126,
+          0.021657833131030202
+        ]
+      }
+    },
+    {
+      "seed": 7,
+      "training_steps": 200,
+      "repeat_count": 3,
+      "quality_identical_across_repeats": true,
+      "counts_identical_across_repeats": true,
+      "training": {
+        "steps": 200,
+        "seconds": 0.5395982079207897,
+        "initial_fp32_nll": 4.351688385009766,
+        "last_training_fp32_nll": 0.0212240107357502,
+        "uses_calibration_texts_for_toy_fit": true
+      },
+      "ranking": {
+        "fast": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.6571428571428571,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.8285714285714286,
+            "positive_harm_top_k_recall": 1.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 5,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": -0.4857142857142857,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.02857142857142857,
+            "positive_harm_top_k_recall": 0.0,
+            "positive_harm_top_k_count": 1,
+            "positive_delta_nll_group_count": 1,
+            "top_k": 2
+          }
+        },
+        "stats": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.02857142857142857,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.14285714285714285,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 5,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": -0.08571428571428572,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.2571428571428571,
+            "positive_harm_top_k_recall": 0.0,
+            "positive_harm_top_k_count": 1,
+            "positive_delta_nll_group_count": 1,
+            "top_k": 2
+          }
+        },
+        "linear_signed": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": -0.42857142857142855,
+            "spearman_absolute_delta_nll_diagnostic_only": -0.37142857142857144,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 5,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": -0.2,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.3142857142857143,
+            "positive_harm_top_k_recall": 0.0,
+            "positive_harm_top_k_count": 1,
+            "positive_delta_nll_group_count": 1,
+            "top_k": 2
+          }
+        },
+        "linear_clipped": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": -0.06761234037828133,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.10141851056742199,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 5,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": null,
+            "spearman_absolute_delta_nll_diagnostic_only": null,
+            "positive_harm_top_k_recall": 0.0,
+            "positive_harm_top_k_count": 1,
+            "positive_delta_nll_group_count": 1,
+            "top_k": 2
+          }
+        },
+        "linear_abs_rms_diagnostic": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.7142857142857143,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.8285714285714286,
+            "positive_harm_top_k_recall": 1.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 5,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.14285714285714285,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.14285714285714285,
+            "positive_harm_top_k_recall": 1.0,
+            "positive_harm_top_k_count": 1,
+            "positive_delta_nll_group_count": 1,
+            "top_k": 2
+          }
+        }
+      },
+      "plans": {
+        "exact": {
+          "assignments": {
+            "layers.0": "bf16",
+            "layers.1": "w4a8",
+            "layers.2": "w4a8",
+            "layers.3": "bf16",
+            "layers.4": "w4a8",
+            "layers.5": "bf16"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 0.02107241507897626,
+          "candidate_nll": 0.021549305878579617,
+          "delta_nll": 0.0004768907996033564,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "fast": {
+          "assignments": {
+            "layers.0": "bf16",
+            "layers.1": "w4a8",
+            "layers.2": "bf16",
+            "layers.3": "bf16",
+            "layers.4": "w4a8",
+            "layers.5": "w4a8"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 0.02107241507897626,
+          "candidate_nll": 0.021105145396136525,
+          "delta_nll": 3.273031716026498e-05,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "stats": {
+          "assignments": {
+            "layers.0": "w4a8",
+            "layers.1": "w4a8",
+            "layers.2": "bf16",
+            "layers.3": "bf16",
+            "layers.4": "w4a8",
+            "layers.5": "bf16"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 0.02107241507897626,
+          "candidate_nll": 0.021105580990995045,
+          "delta_nll": 3.3165912018785076e-05,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "linear_signed": {
+          "assignments": {
+            "layers.0": "bf16",
+            "layers.1": "bf16",
+            "layers.2": "bf16",
+            "layers.3": "w4a8",
+            "layers.4": "w4a8",
+            "layers.5": "w4a8"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 0.02107241507897626,
+          "candidate_nll": 0.021742430098577223,
+          "delta_nll": 0.0006700150196009627,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "linear_clipped": {
+          "assignments": {
+            "layers.0": "bf16",
+            "layers.1": "w4a8",
+            "layers.2": "bf16",
+            "layers.3": "w4a8",
+            "layers.4": "w4a8",
+            "layers.5": "bf16"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 0.02107241507897626,
+          "candidate_nll": 0.021739086261324918,
+          "delta_nll": 0.0006666711823486576,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "linear_abs_rms_diagnostic": {
+          "assignments": {
+            "layers.0": "bf16",
+            "layers.1": "w4a8",
+            "layers.2": "w4a8",
+            "layers.3": "bf16",
+            "layers.4": "bf16",
+            "layers.5": "w4a8"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 0.02107241507897626,
+          "candidate_nll": 0.021090162765067904,
+          "delta_nll": 1.7747686091643816e-05,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        }
+      },
+      "actual_counts": {
+        "run": {
+          "full_forwards": 26,
+          "backwards": 0,
+          "block_forwards": 156
+        },
+        "run_fast": {
+          "full_forwards": 2,
+          "backwards": 2,
+          "block_forwards": 36
+        },
+        "run_fast_stats": {
+          "full_forwards": 2,
+          "backwards": 2,
+          "block_forwards": 12
+        },
+        "run_linear_taylor": {
+          "full_forwards": 2,
+          "backwards": 2,
+          "block_forwards": 12,
+          "local_linear_candidates": 168,
+          "local_linear_chunk_matmuls": 168,
+          "local_block_replays": 0
+        }
+      },
+      "analysis_seconds_by_repeat": {
+        "run": [
+          0.03814520896412432,
+          0.03753149998374283,
+          0.03746762499213219
+        ],
+        "run_fast": [
+          0.022193999961018562,
+          0.020706084091216326,
+          0.02135666599497199
+        ],
+        "run_fast_stats": [
+          0.020205707987770438,
+          0.02045558299869299,
+          0.019598582992330194
+        ],
+        "run_linear_taylor": [
+          0.0191147078294307,
+          0.0191253749653697,
+          0.019189500017091632
+        ]
+      }
+    },
+    {
+      "seed": 17,
+      "training_steps": 200,
+      "repeat_count": 3,
+      "quality_identical_across_repeats": true,
+      "counts_identical_across_repeats": true,
+      "training": {
+        "steps": 200,
+        "seconds": 0.5366468750871718,
+        "initial_fp32_nll": 4.392406940460205,
+        "last_training_fp32_nll": 0.01669473946094513,
+        "uses_calibration_texts_for_toy_fit": true
+      },
+      "ranking": {
+        "fast": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": -0.6,
+            "spearman_absolute_delta_nll_diagnostic_only": -0.42857142857142855,
+            "positive_harm_top_k_recall": 0.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 5,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.6571428571428571,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.7714285714285715,
+            "positive_harm_top_k_recall": 1.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 2,
+            "top_k": 2
+          }
+        },
+        "stats": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.2,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.4857142857142857,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 5,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.9428571428571428,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.4857142857142857,
+            "positive_harm_top_k_recall": 1.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 2,
+            "top_k": 2
+          }
+        },
+        "linear_signed": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.3142857142857143,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.02857142857142857,
+            "positive_harm_top_k_recall": 0.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 5,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": -0.02857142857142857,
+            "spearman_absolute_delta_nll_diagnostic_only": -0.2571428571428571,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 2,
+            "top_k": 2
+          }
+        },
+        "linear_clipped": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": -0.13522468075656266,
+            "spearman_absolute_delta_nll_diagnostic_only": -0.304255531702266,
+            "positive_harm_top_k_recall": 0.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 5,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.11595420713048969,
+            "spearman_absolute_delta_nll_diagnostic_only": -0.20291986247835694,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 2,
+            "top_k": 2
+          }
+        },
+        "linear_abs_rms_diagnostic": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.08571428571428572,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.4857142857142857,
+            "positive_harm_top_k_recall": 0.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 5,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.2,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.7142857142857143,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 2,
+            "top_k": 2
+          }
+        }
+      },
+      "plans": {
+        "exact": {
+          "assignments": {
+            "layers.0": "bf16",
+            "layers.1": "bf16",
+            "layers.2": "w4a8",
+            "layers.3": "bf16",
+            "layers.4": "w4a8",
+            "layers.5": "w4a8"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 0.016301638683053985,
+          "candidate_nll": 0.016644702251277753,
+          "delta_nll": 0.00034306356822376774,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "fast": {
+          "assignments": {
+            "layers.0": "w4a8",
+            "layers.1": "bf16",
+            "layers.2": "bf16",
+            "layers.3": "w4a8",
+            "layers.4": "w4a8",
+            "layers.5": "bf16"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 0.016301638683053985,
+          "candidate_nll": 0.016324478076465095,
+          "delta_nll": 2.2839393411109438e-05,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "stats": {
+          "assignments": {
+            "layers.0": "w4a8",
+            "layers.1": "w4a8",
+            "layers.2": "bf16",
+            "layers.3": "bf16",
+            "layers.4": "w4a8",
+            "layers.5": "bf16"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 0.016301638683053985,
+          "candidate_nll": 0.016455211190145407,
+          "delta_nll": 0.00015357250709142206,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "linear_signed": {
+          "assignments": {
+            "layers.0": "bf16",
+            "layers.1": "bf16",
+            "layers.2": "w4a8",
+            "layers.3": "w4a8",
+            "layers.4": "bf16",
+            "layers.5": "w4a8"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 0.016301638683053985,
+          "candidate_nll": 0.0163307473230273,
+          "delta_nll": 2.9108639973313838e-05,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "linear_clipped": {
+          "assignments": {
+            "layers.0": "w4a8",
+            "layers.1": "bf16",
+            "layers.2": "w4a8",
+            "layers.3": "w4a8",
+            "layers.4": "bf16",
+            "layers.5": "bf16"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 0.016301638683053985,
+          "candidate_nll": 0.01669835710703437,
+          "delta_nll": 0.0003967184239803863,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "linear_abs_rms_diagnostic": {
+          "assignments": {
+            "layers.0": "w4a8",
+            "layers.1": "bf16",
+            "layers.2": "bf16",
+            "layers.3": "bf16",
+            "layers.4": "w4a8",
+            "layers.5": "w4a8"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 0.016301638683053985,
+          "candidate_nll": 0.016657203713904566,
+          "delta_nll": 0.00035556503085058117,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        }
+      },
+      "actual_counts": {
+        "run_fast": {
+          "full_forwards": 2,
+          "backwards": 2,
+          "block_forwards": 36
+        },
+        "run_fast_stats": {
+          "full_forwards": 2,
+          "backwards": 2,
+          "block_forwards": 12
+        },
+        "run_linear_taylor": {
+          "full_forwards": 2,
+          "backwards": 2,
+          "block_forwards": 12,
+          "local_linear_candidates": 168,
+          "local_linear_chunk_matmuls": 168,
+          "local_block_replays": 0
+        },
+        "run": {
+          "full_forwards": 26,
+          "backwards": 0,
+          "block_forwards": 156
+        }
+      },
+      "analysis_seconds_by_repeat": {
+        "run_fast": [
+          0.021654417039826512,
+          0.021621499909088016,
+          0.021523915929719806
+        ],
+        "run_fast_stats": [
+          0.019945875043049455,
+          0.019759083166718483,
+          0.019453916931524873
+        ],
+        "run_linear_taylor": [
+          0.018689791904762387,
+          0.019055208889767528,
+          0.019155040849000216
+        ],
+        "run": [
+          0.037982209119945765,
+          0.03739541699178517,
+          0.03746312507428229
+        ]
+      }
+    },
+    {
+      "seed": 29,
+      "training_steps": 200,
+      "repeat_count": 3,
+      "quality_identical_across_repeats": true,
+      "counts_identical_across_repeats": true,
+      "training": {
+        "steps": 200,
+        "seconds": 0.546342832967639,
+        "initial_fp32_nll": 4.343029499053955,
+        "last_training_fp32_nll": 0.084447480738163,
+        "uses_calibration_texts_for_toy_fit": true
+      },
+      "ranking": {
+        "fast": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.5428571428571428,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.8857142857142857,
+            "positive_harm_top_k_recall": 1.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 3,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": -0.6,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.7714285714285715,
+            "positive_harm_top_k_recall": 0.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 4,
+            "top_k": 2
+          }
+        },
+        "stats": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.08571428571428572,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.2571428571428571,
+            "positive_harm_top_k_recall": 0.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 3,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.08571428571428572,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.7714285714285715,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 4,
+            "top_k": 2
+          }
+        },
+        "linear_signed": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.9428571428571428,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.42857142857142855,
+            "positive_harm_top_k_recall": 1.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 3,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.2571428571428571,
+            "spearman_absolute_delta_nll_diagnostic_only": -0.7142857142857143,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 4,
+            "top_k": 2
+          }
+        },
+        "linear_clipped": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.7775419143502352,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.7775419143502352,
+            "positive_harm_top_k_recall": 1.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 3,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.09107651110783745,
+            "spearman_absolute_delta_nll_diagnostic_only": -0.5161002296110788,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 4,
+            "top_k": 2
+          }
+        },
+        "linear_abs_rms_diagnostic": {
+          "w4a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.7142857142857143,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.7714285714285715,
+            "positive_harm_top_k_recall": 1.0,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 3,
+            "top_k": 2
+          },
+          "w8a8": {
+            "group_count": 6,
+            "spearman_signed_delta_nll": 0.02857142857142857,
+            "spearman_absolute_delta_nll_diagnostic_only": 0.8857142857142857,
+            "positive_harm_top_k_recall": 0.5,
+            "positive_harm_top_k_count": 2,
+            "positive_delta_nll_group_count": 4,
+            "top_k": 2
+          }
+        }
+      },
+      "plans": {
+        "exact": {
+          "assignments": {
+            "layers.0": "bf16",
+            "layers.1": "w4a8",
+            "layers.2": "bf16",
+            "layers.3": "bf16",
+            "layers.4": "w4a8",
+            "layers.5": "w4a8"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 0.11140133535016829,
+          "candidate_nll": 0.10242763890036896,
+          "delta_nll": -0.008973696449799326,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "fast": {
+          "assignments": {
+            "layers.0": "bf16",
+            "layers.1": "bf16",
+            "layers.2": "w4a8",
+            "layers.3": "bf16",
+            "layers.4": "w4a8",
+            "layers.5": "w4a8"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 0.11140133535016829,
+          "candidate_nll": 0.1104171195470575,
+          "delta_nll": -0.0009842158031107828,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "stats": {
+          "assignments": {
+            "layers.0": "w4a8",
+            "layers.1": "bf16",
+            "layers.2": "bf16",
+            "layers.3": "bf16",
+            "layers.4": "w4a8",
+            "layers.5": "w4a8"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 0.11140133535016829,
+          "candidate_nll": 0.11447982984914709,
+          "delta_nll": 0.003078494498978804,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "linear_signed": {
+          "assignments": {
+            "layers.0": "bf16",
+            "layers.1": "w4a8",
+            "layers.2": "bf16",
+            "layers.3": "bf16",
+            "layers.4": "w4a8",
+            "layers.5": "w4a8"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 0.11140133535016829,
+          "candidate_nll": 0.10242763890036896,
+          "delta_nll": -0.008973696449799326,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "linear_clipped": {
+          "assignments": {
+            "layers.0": "bf16",
+            "layers.1": "w4a8",
+            "layers.2": "w4a8",
+            "layers.3": "bf16",
+            "layers.4": "w4a8",
+            "layers.5": "bf16"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 0.11140133535016829,
+          "candidate_nll": 0.11047390631552953,
+          "delta_nll": -0.0009274290346387576,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        },
+        "linear_abs_rms_diagnostic": {
+          "assignments": {
+            "layers.0": "bf16",
+            "layers.1": "w4a8",
+            "layers.2": "bf16",
+            "layers.3": "bf16",
+            "layers.4": "w4a8",
+            "layers.5": "w4a8"
+          },
+          "quantized_fraction": 0.5,
+          "baseline_nll": 0.11140133535016829,
+          "candidate_nll": 0.10242763890036896,
+          "delta_nll": -0.008973696449799326,
+          "token_count": 67,
+          "note": "Fixed group-count budget, not a latency-optimal solver result."
+        }
+      },
+      "actual_counts": {
+        "run_fast_stats": {
+          "full_forwards": 2,
+          "backwards": 2,
+          "block_forwards": 12
+        },
+        "run_linear_taylor": {
+          "full_forwards": 2,
+          "backwards": 2,
+          "block_forwards": 12,
+          "local_linear_candidates": 168,
+          "local_linear_chunk_matmuls": 168,
+          "local_block_replays": 0
+        },
+        "run": {
+          "full_forwards": 26,
+          "backwards": 0,
+          "block_forwards": 156
+        },
+        "run_fast": {
+          "full_forwards": 2,
+          "backwards": 2,
+          "block_forwards": 36
+        }
+      },
+      "analysis_seconds_by_repeat": {
+        "run_fast_stats": [
+          0.020057083806023,
+          0.01957887504249811,
+          0.020195249933749437
+        ],
+        "run_linear_taylor": [
+          0.018612208776175976,
+          0.01933224988169968,
+          0.018939750036224723
+        ],
+        "run": [
+          0.03735999995842576,
+          0.03707254212349653,
+          0.036694665905088186
+        ],
+        "run_fast": [
+          0.021972708869725466,
+          0.021306541981175542,
+          0.022051416104659438
+        ]
+      }
+    }
+  ]
+}

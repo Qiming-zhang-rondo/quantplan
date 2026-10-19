@@ -30,10 +30,12 @@ from typing import Any
 
 from quantplan.domain.models import (
     ApproximateMeasurement,
+    DirectionalMeasurement,
     GroupInventory,
     InterventionMeasurement,
     PlanEvaluation,
     PrecisionFormat,
+    StatisticalMeasurement,
 )
 from quantplan.runtime.architecture import (
     BASE_SAFETY_EXCLUDES,
@@ -200,6 +202,10 @@ class RuntimeProvenance:
     backward_dataset_passes: int
     local_block_replays: int
     created_at_utc: str
+    local_gradient_projections: int = 0
+    local_gradient_gemms: int = 0
+    candidate_weight_scans: int = 0
+    candidate_affine_evaluations: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -251,6 +257,10 @@ class RuntimeProvenance:
             "backward_dataset_passes": self.backward_dataset_passes,
             "local_block_replays": self.local_block_replays,
             "created_at_utc": self.created_at_utc,
+            "local_gradient_projections": self.local_gradient_projections,
+            "local_gradient_gemms": self.local_gradient_gemms,
+            "candidate_weight_scans": self.candidate_weight_scans,
+            "candidate_affine_evaluations": self.candidate_affine_evaluations,
         }
 
 
@@ -261,7 +271,10 @@ class AnalysisRunResult:
     provenance: RuntimeProvenance
     baseline_nll: float
     token_count: int
-    measurements: tuple[InterventionMeasurement | ApproximateMeasurement, ...]
+    measurements: tuple[
+        InterventionMeasurement | ApproximateMeasurement | StatisticalMeasurement
+        | DirectionalMeasurement, ...
+    ]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1320,6 +1333,35 @@ class TorchAnalysisRuntime:
             measurements=tuple(measurements),
         )
 
+    def run_fast_stats(
+        self,
+        precisions: Sequence[PrecisionFormat | str] = (
+            PrecisionFormat.W4A8,
+            PrecisionFormat.W8A8,
+        ),
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> AnalysisRunResult:
+        """Experimental one-sweep Linear statistics, without candidate block replays."""
+
+        from quantplan.runtime.stats_analysis import run_fast_stats
+
+        return run_fast_stats(self, precisions, progress_callback=progress_callback)
+
+    def run_fast_taylor(
+        self,
+        precisions: Sequence[PrecisionFormat | str] = (
+            PrecisionFormat.W4A8,
+            PrecisionFormat.W8A8,
+        ),
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> AnalysisRunResult:
+        """Experimental signed Taylor ranking with shared local gradient projections."""
+        from quantplan.runtime.directional_analysis import run_fast_taylor
+
+        return run_fast_taylor(self, precisions, progress_callback=progress_callback)
+
     def evaluate_plan(
         self,
         assignments: Mapping[str, PrecisionFormat | str],
@@ -2090,9 +2132,11 @@ def temporary_group_fake_quant(
         yield
 
 
-def _fake_quant_weight(torch: Any, value: Any, bits: int) -> Any:
+def _fake_quant_weight(
+    torch: Any, value: Any, bits: int, *, check_finite: bool = True,
+) -> Any:
     work = value.detach().to(dtype=torch.float32)
-    if not bool(torch.isfinite(work).all()):
+    if check_finite and not bool(torch.isfinite(work).all()):
         raise TorchAnalysisError("Linear weight contains non-finite values")
     qmax = float((1 << (bits - 1)) - 1)
     # Linear [out, in] and fused expert [expert, out, in] weights both use a
@@ -2165,11 +2209,13 @@ def _fake_quantize_parameter_in_place(
         target.copy_(_fake_quant_weight(torch, target, bits))
 
 
-def _fake_quant_activation(torch: Any, value: Any, bits: int) -> Any:
+def _fake_quant_activation(
+    torch: Any, value: Any, bits: int, *, check_finite: bool = True,
+) -> Any:
     if not value.is_floating_point():
         return value
     work = value.to(dtype=torch.float32)
-    if not bool(torch.isfinite(work).all()):
+    if check_finite and not bool(torch.isfinite(work).all()):
         raise TorchAnalysisError("Linear activation contains non-finite values")
     qmax = float((1 << (bits - 1)) - 1)
     maximum = work.abs().amax(dim=-1, keepdim=True)
@@ -2426,6 +2472,22 @@ def _maybe_split_decision_groups(
                             if category == "mla_preprocess"
                             else "independent"
                         ),
+                        operator_shapes={
+                            **{
+                                name: tuple(int(dimension) for dimension in modules[name].weight.shape)
+                                for name in linears
+                            },
+                            **{
+                                f"{target.module_name}.{parameter_name}": tuple(
+                                    int(dimension)
+                                    for dimension in getattr(
+                                        modules[target.module_name], parameter_name
+                                    ).shape
+                                )
+                                for target in experts
+                                for parameter_name in target.parameter_names
+                            },
+                        },
                     ),
                     block_module_names=(root,),
                     linear_module_names=tuple(linears),
@@ -2631,6 +2693,22 @@ def _build_runtime_groups(
                     parameter_count=parameter_count,
                     warnings=tuple(group_warnings),
                     backend_patterns=tuple(backend_patterns),
+                    operator_shapes={
+                        **{
+                            name: tuple(int(dimension) for dimension in modules[name].weight.shape)
+                            for name in linear_names
+                        },
+                        **{
+                            f"{target.module_name}.{parameter_name}": tuple(
+                                int(dimension)
+                                for dimension in getattr(
+                                    modules[target.module_name], parameter_name
+                                ).shape
+                            )
+                            for target in expert_targets
+                            for parameter_name in target.parameter_names
+                        },
+                    },
                 ),
                 block_module_names=tuple(module_names),
                 linear_module_names=tuple(linear_names),
@@ -2745,8 +2823,41 @@ def _group_inventory_to_dict(group: GroupInventory) -> dict[str, Any]:
 
 
 def _measurement_to_dict(
-    measurement: InterventionMeasurement | ApproximateMeasurement,
+    measurement: (
+        InterventionMeasurement | ApproximateMeasurement | StatisticalMeasurement
+        | DirectionalMeasurement
+    ),
 ) -> dict[str, Any]:
+    if isinstance(measurement, DirectionalMeasurement):
+        return {
+            "group_id": measurement.group_id,
+            "precision": measurement.precision.value,
+            "context_id": measurement.context_id,
+            "module_names": list(measurement.module_names),
+            "parameter_count": measurement.parameter_count,
+            "estimated_risk": measurement.estimated_risk,
+            "token_count": measurement.token_count,
+            "elapsed_seconds": measurement.elapsed_seconds,
+            "metric_id": measurement.metric_id,
+            "mean_first_order_effect": measurement.mean_first_order_effect,
+            "ranking_offset": measurement.ranking_offset,
+            "warnings": list(measurement.warnings),
+        }
+    if isinstance(measurement, StatisticalMeasurement):
+        return {
+            "group_id": measurement.group_id,
+            "precision": measurement.precision.value,
+            "context_id": measurement.context_id,
+            "module_names": list(measurement.module_names),
+            "parameter_count": measurement.parameter_count,
+            "estimated_risk": measurement.estimated_risk,
+            "weight_risk": measurement.weight_risk,
+            "activation_risk": measurement.activation_risk,
+            "token_count": measurement.token_count,
+            "elapsed_seconds": measurement.elapsed_seconds,
+            "metric_id": measurement.metric_id,
+            "warnings": list(measurement.warnings),
+        }
     if isinstance(measurement, ApproximateMeasurement):
         return {
             "group_id": measurement.group_id,
@@ -3385,12 +3496,15 @@ def _temporary_freeze_parameters(model: Any) -> Iterator[None]:
 
 @contextmanager
 def _evaluation_mode(model: Any) -> Iterator[None]:
-    was_training = bool(getattr(model, "training", False))
+    # Restore heterogeneous flags too (for example a frozen norm in a training
+    # parent); model.train(was_training) would recursively overwrite them.
+    training_flags = tuple((module, bool(module.training)) for module in model.modules())
     model.eval()
     try:
         yield
     finally:
-        model.train(was_training)
+        for module, was_training in training_flags:
+            module.training = was_training
 
 
 def _require_torch() -> Any:

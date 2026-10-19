@@ -22,12 +22,15 @@ from quantplan.adapters.modelslim import (
 from quantplan.artifacts import ArtifactError, ArtifactStore
 from quantplan.domain import (
     ApproximateMeasurement,
+    DirectionalMeasurement,
     GroupInventory,
     InterventionMeasurement,
     PlanEvaluation,
     PrecisionFormat,
     QuantPlan,
+    StatisticalMeasurement,
 )
+from quantplan.latency import build_latency_provider
 from quantplan.planning import (
     PlanningPolicy,
     build_candidate_set,
@@ -36,11 +39,22 @@ from quantplan.planning import (
 )
 from quantplan.run_config import RunConfig
 
+_DIRECTIONAL_EVIDENCE_ROLE = (
+    "shared projection signed first-order; one extra local gradient projection per Linear/batch "
+    "(possibly multiple chunk GEMMs), "
+    "no candidate affine/block replay"
+)
+
 
 class AnalysisResultLike(Protocol):
     groups: Sequence[GroupInventory]
     module_inventory: Sequence[str]
-    measurements: Sequence[InterventionMeasurement | ApproximateMeasurement]
+    measurements: Sequence[
+        InterventionMeasurement
+        | ApproximateMeasurement
+        | StatisticalMeasurement
+        | DirectionalMeasurement
+    ]
     provenance: Any
 
 
@@ -58,6 +72,20 @@ class AnalysisRuntimeLike(Protocol):
     ) -> AnalysisResultLike: ...
 
     def run_fast(
+        self,
+        precisions: Sequence[PrecisionFormat],
+        *,
+        progress_callback: Callable[[str, int, int, str, str], None] | None = None,
+    ) -> AnalysisResultLike: ...
+
+    def run_fast_stats(
+        self,
+        precisions: Sequence[PrecisionFormat],
+        *,
+        progress_callback: Callable[[str, int, int, str, str], None] | None = None,
+    ) -> AnalysisResultLike: ...
+
+    def run_fast_taylor(
         self,
         precisions: Sequence[PrecisionFormat],
         *,
@@ -103,8 +131,10 @@ def execute_workflow(
     """Run the complete evidence loop with an already constructed runtime."""
 
     config.validate_for_run()
-    if analysis_mode not in {"exact", "fast"}:
-        raise ValueError("analysis_mode must be 'exact' or 'fast'")
+    if analysis_mode not in {"exact", "fast", "fast-stats", "fast-taylor"}:
+        raise ValueError("analysis_mode must be 'exact', 'fast', 'fast-stats' or 'fast-taylor'")
+    early_stop_on_pass = analysis_mode in {"fast-stats", "fast-taylor"}
+    validation_cap = None if analysis_mode == "exact" else 3
     _prepare_output(config, overwrite=overwrite)
     store = ArtifactStore(config.output_dir, overwrite=overwrite)
     manifest_store = ArtifactStore(config.output_dir, overwrite=True)
@@ -173,7 +203,14 @@ def execute_workflow(
         analysis_precisions = tuple(
             dict.fromkeys((*config.candidates.precisions, *source_anchor_precisions))
         )
-        analysis_runner = runtime.run if analysis_mode == "exact" else runtime.run_fast
+        if analysis_mode == "exact":
+            analysis_runner = runtime.run
+        elif analysis_mode == "fast":
+            analysis_runner = runtime.run_fast
+        elif analysis_mode == "fast-stats":
+            analysis_runner = runtime.run_fast_stats
+        else:
+            analysis_runner = runtime.run_fast_taylor
         result = analysis_runner(
             analysis_precisions,
             progress_callback=_measurement_progress(progress),
@@ -199,6 +236,66 @@ def execute_workflow(
             config.output.risk_evidence,
             (_measurement_payload(item) for item in measurements),
         )
+        latency_provider = build_latency_provider(
+            mode=config.latency.mode,
+            deployment_mode=config.latency.deployment_mode,
+            hardware_profile=config.runtime.hardware_profile,
+            memory_bandwidth_gbps=config.latency.memory_bandwidth_gbps,
+            compute_tflops=config.latency.compute_tflops,
+            memory_efficiency=config.latency.memory_efficiency,
+            compute_efficiency=config.latency.compute_efficiency,
+            launch_overhead_us=config.latency.launch_overhead_us,
+            qdq_overhead_us=config.latency.qdq_overhead_us,
+            layout_overhead_us=config.latency.layout_overhead_us,
+            fallback_overhead_us=config.latency.fallback_overhead_us,
+            uncertainty=config.latency.uncertainty,
+            calibration_path=config.latency.calibration_path,
+        )
+        if latency_provider is not None:
+            _progress(
+                progress,
+                "latency_model_ready",
+                dict(latency_provider.summary()),
+            )
+            latency_payload = {
+                "schema_version": "quantplan.latency-report/v1",
+                "provider": dict(latency_provider.summary()),
+                "candidates": [],
+            }
+            for inventory in groups:
+                for precision in analysis_precisions:
+                    if (
+                        inventory.allowed_formats is not None
+                        and precision not in inventory.allowed_formats
+                    ):
+                        continue
+                    estimate = latency_provider.estimate(inventory, precision)
+                    latency_payload["candidates"].append(
+                        {
+                            "group_id": inventory.group_id,
+                            "precision": precision.value,
+                            "seconds": estimate.seconds,
+                            "lower_bound": estimate.lower_bound,
+                            "upper_bound": estimate.upper_bound,
+                            "confidence": estimate.confidence,
+                            "model": estimate.model,
+                            "components": dict(estimate.components),
+                            "warnings": list(estimate.warnings),
+                        }
+                    )
+            store.write_json(config.output.latency_report, latency_payload)
+        else:
+            store.write_json(
+                config.output.latency_report,
+                {
+                    "schema_version": "quantplan.latency-report/v1",
+                    "provider": {"mode": "off"},
+                    "candidates": [],
+                    "warnings": [
+                        "latency model disabled; estimated_cost uses normalized parameter-count proxies"
+                    ],
+                },
+            )
         planning_policy = PlanningPolicy(
             base_precision=config.search.base_precision,
             max_high_precision_fraction=config.search.high_precision_fraction,
@@ -211,6 +308,7 @@ def execute_workflow(
             allowed_formats=analysis_precisions,
             policy=planning_policy,
             relative_costs=config.search.costs,
+            latency_provider=latency_provider,
         )
         if not candidate_set.plans:
             reasons = "; ".join(candidate_set.rejected_reasons) or "no plan candidates"
@@ -219,11 +317,14 @@ def execute_workflow(
         candidate_payload = {
             "schema_version": "quantplan.candidate-set/v1",
             "analysis_mode": analysis_mode,
-            "claim": (
-                "unvalidated proposals from candidate-specific whole-model interventions"
-                if analysis_mode == "exact"
-                else "unvalidated proposals from gradient-weighted local approximations"
-            ),
+            "claim": {
+                "exact": "unvalidated proposals from candidate-specific whole-model interventions",
+                "fast": "unvalidated proposals from gradient-weighted local approximations",
+                "fast-stats": (
+                    "unvalidated proposals from factorized gradient statistics; no block replay"
+                ),
+                "fast-taylor": f"unvalidated proposals from {_DIRECTIONAL_EVIDENCE_ROLE}",
+            }[analysis_mode],
             "max_estimated_cost": candidate_set.max_estimated_cost,
             "source_yaml_safe_anchors": {
                 group.group_id: group.source_precision.value
@@ -232,6 +333,10 @@ def execute_workflow(
             },
             "rejected_reasons": list(candidate_set.rejected_reasons),
             "plans": [_plan_payload(plan) for plan in candidate_set.plans],
+            "latency_model": (
+                dict(latency_provider.summary()) if latency_provider is not None else {"mode": "off"}
+            ),
+            "evidence": [_jsonable(item) for item in candidate_set.evidence],
         }
         store.write_json(config.output.candidate_plan, candidate_payload)
 
@@ -240,8 +345,9 @@ def execute_workflow(
             candidate_set.plans,
             key=lambda item: (item.estimated_cost, item.proposal_score),
         )
-        if analysis_mode == "fast":
-            ordered_plans = ordered_plans[:3]
+        if validation_cap is not None:
+            ordered_plans = ordered_plans[:validation_cap]
+        validated_plans: list[QuantPlan] = []
         for index, plan in enumerate(ordered_plans, start=1):
             identifier = plan_id(plan)
             _progress(
@@ -255,22 +361,30 @@ def execute_workflow(
             )
             if evaluation.plan_id != identifier:
                 raise RuntimeError("runtime returned a mismatched plan evaluation ID")
+            if evaluation.context_id != plan.context_id:
+                raise ValueError(f"evaluation context mismatch for {identifier}")
+            validated_plans.append(plan)
             evaluations.append(evaluation)
             _progress(
                 progress,
                 "plan_validation_completed",
                 {"plan_id": identifier, "delta_nll": evaluation.delta_nll},
             )
+            if early_stop_on_pass and evaluation.passes(
+                max_delta_nll=config.search.max_delta_nll
+            ):
+                break
 
         selected = choose_lowest_cost_passing_plan(
-            ordered_plans,
+            validated_plans,
             evaluations,
             max_delta_nll=config.search.max_delta_nll,
         )
         validation_payload = {
             "schema_version": "quantplan.validation-report/v1",
             "analysis_mode": analysis_mode,
-            "validation_cap": 3 if analysis_mode == "fast" else None,
+            "validation_cap": validation_cap,
+            "early_stop_on_pass": early_stop_on_pass,
             "gate": {
                 "metric": "teacher_forced_delta_nll_per_token",
                 "maximum": config.search.max_delta_nll,
@@ -287,6 +401,39 @@ def execute_workflow(
                         "fast mode exactly validates at most the three cheapest proposals",
                     ]
                     if analysis_mode == "fast"
+                    else []
+                ),
+                *(
+                    [
+                        (
+                            "fast-stats proposal scores use factorized gradient statistics, "
+                            "not observed delta NLL or first-order replay effects; no block replay"
+                        ),
+                        (
+                            "fast-stats validates at most the three cheapest proposals and "
+                            "stops at the first passing plan"
+                        ),
+                    ]
+                    if analysis_mode == "fast-stats"
+                    else []
+                ),
+                *(
+                    [
+                        f"fast-taylor proposal scores use {_DIRECTIONAL_EVIDENCE_ROLE}",
+                        (
+                            "fast-taylor scores preserve signed effects with a shared per-group "
+                            "ranking offset; they are not observed delta NLL"
+                        ),
+                        (
+                            "cross-group sensitivity ranking must use mean_first_order_effect, "
+                            "not offset-adjusted estimated_risk"
+                        ),
+                        (
+                            "fast-taylor validates at most the three cheapest proposals and "
+                            "stops at the first passing plan"
+                        ),
+                    ]
+                    if analysis_mode == "fast-taylor"
                     else []
                 ),
                 "target-hardware execution readiness is not assessed",
@@ -630,12 +777,21 @@ def _dataset_binding(
 
 
 def _measurement_payload(
-    item: InterventionMeasurement | ApproximateMeasurement,
+    item: (
+        InterventionMeasurement
+        | ApproximateMeasurement
+        | StatisticalMeasurement
+        | DirectionalMeasurement
+    ),
 ) -> dict[str, Any]:
     payload = _jsonable(item)
     if isinstance(item, InterventionMeasurement):
         payload["delta_nll"] = item.delta_nll
         payload["evidence_role"] = "candidate-specific whole-model intervention"
+    elif isinstance(item, StatisticalMeasurement):
+        payload["evidence_role"] = "factorized gradient statistics; no block replay"
+    elif isinstance(item, DirectionalMeasurement):
+        payload["evidence_role"] = _DIRECTIONAL_EVIDENCE_ROLE
     else:
         payload["evidence_role"] = "gradient-weighted local approximation"
     return payload

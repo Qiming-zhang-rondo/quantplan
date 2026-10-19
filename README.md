@@ -134,6 +134,31 @@ teacher-forced NLL 的梯度，再分别对 W4A8/W8A8 做 Block 局部无状态�
 quantplan run --config quantplan-run.yaml --mode fast
 ```
 
+### 快速 latency 估算
+
+`--mode fast` 现在可以同时使用一个轻量的 Roofline latency provider。它不运行每个完整量化方案，而是根据参数规模、权重位宽和配置的硬件带宽/算力估算候选成本，再把该成本交给同一个 bit-width solver。当前版本将 operator shape 的维度乘积用于计算参数规模，按单 token GEMV 近似；`deployment_mode` 仅是报告标签，尚未切换 prefill/decode 或 batch/sequence 长度相关的计算公式。它不是完整的 shape-aware 部署延迟模型。启用方式：
+
+```yaml
+latency:
+  mode: static              # off, static or calibrated
+  deployment_mode: decode_bs1
+  memory_bandwidth_gbps: 1200
+  compute_tflops: 300
+  memory_efficiency: 0.70
+  compute_efficiency: 0.50
+  launch_overhead_us: 2.0
+  qdq_overhead_us: 1.0
+  layout_overhead_us: 0.5
+  fallback_overhead_us: 5.0
+  uncertainty: 0.25
+```
+
+也可以用 `quantplan run --config quantplan-run.yaml --mode fast --latency-mode static` 临时覆盖配置。输出目录会生成 `latency-report.json`，其中包含每个决策域/候选精度的预测区间、模型组成和 warning。`static` 是相对排序信号，不是目标推理引擎的实测值；`calibrated` 需要一个 `quantplan.latency-calibration/v1` JSON 文件，使用少量 microbenchmark 修正 operator 预测。无论哪种模式，fast 排名后仍只对最多三个完整候选方案做质量复测。
+
+上下界和 `confidence` 来自配置的启发式不确定性，不是经过实测验证的统计置信区间；示例校准文件也不代表已经完成 A3/A5 或其他目标硬件校准。
+
+对于 PrologV3、MLA、GDN 和 fused MoE，决策组按 runtime quantization domain 估算；如果域的能力快照没有证明候选格式，仍保持 source YAML 锚点，不会把内部 Linear 当作独立可加速算子。
+
 对某个 Block 和候选精度，Fast V1 计算每个有效 token 的一阶影响
 `z = sum(输出梯度 × 候选输出差)`，排序风险为
 `abs(mean(z)) + rms(z)`。它同时考虑候选量化误差和该误差对最终 NLL 的影响，
@@ -146,12 +171,146 @@ Fast 将模型参数冻结，因此不产生权重梯度，并且用无状态量
 Block root 时会明确阻断，不会悄悄退回低可信指标。对 GLM、DeepSeek、Kimi 等
 新适配器，必须先在小规模 exact 对照上验证 Fast 排序相关性。
 
+### 实验性统计模式：无 Block 重放
+
+```bash
+quantplan run --config quantplan-run.yaml --mode fast-stats
+```
+
+`fast-stats` 用一轮校准数据集的前向、反向收集所有目标 Linear 的统计量，
+随后扫描候选量化权重计算风险，不再为每个决策组/精度重放 Block。
+“一次 F+B”指**每个 batch 各一次**，不是无论多少样本都只调用模型一次；
+权重量化扫描、统计计算和最终方案验证仍有开销，也仍需要反向激活内存。
+默认模式保持 `exact`，原 `fast` 行为不变。
+
+对 `y = Wx`，记 `mean` 为整个校准集有效位置上的均值，梯度来自最终
+teacher-forced **NLL 总和**（不是各 batch 的均值）：
+
+```text
+u[j] = mean(x[j]^2)
+v[i] = mean((dL_sum/dy[i])^2)
+weight_risk(q) = sum(i,j, v[i] * u[j] * (Qq(W)[i,j] - W[i,j])^2)
+activation_risk = sum(j, mean((Q8(x)[j] - x[j])^2)
+                        * mean((dL_sum/dx_branch[j])^2))
+group_risk(q) = sum(该组 Linear 的 weight_risk(q) + activation_risk)
+```
+
+`x_branch` 是当前 Linear 的独立输入分支，不能混入使用同一输入的旁路梯度。
+最终损失梯度经过实际残差、Norm 和注意力路径，然而分解统计丢弃了通道/位置
+相关性、误差符号、跨模块及权重/激活交叉项；它**不是精确 Fisher、Hessian
+或预测 ΔNLL**。BF16 风险为零。输出使用独立的 `StatisticalMeasurement`，
+不冒充局部重放测量，也不能和其他指标版本混合规划。
+
+第一版边界：
+
+- 仅支持标准 `torch.nn.Linear`，输入/输出为 `[batch, sequence, channel]`；
+  候选为 W4A8 / W8A8 / BF16，尚不支持 W4A4 或 fused expert 内部统计。
+- 未观察到的目标、重复调用同一 Linear、缺失梯度、开启 gradient checkpointing
+  均明确报错，不将缺失证据当作“不敏感”，不自动换回其他指标。
+- 因此不能直接宣称支持 Qwen3.5-35B MoE 全模型。先用 `modules.include`
+  选取确认是普通 Linear 的代表性子集；仅设 `analysis.max_groups` 不会排除专家。
+- 继承已有单进程模块分片加载限制，未新增 TP/EP、CPU/disk offload 支持；
+  新统计 hook 的多卡/NPU 表现仍需内网验证。
+- 沿用 YAML 安全锚点、runtime capability 和可选 latency provider。
+  风险只负责提案；按成本最多复测 3 个完整组合，首个通过 ΔNLL 门槛即停止。
+  验证是额外完整前向；开启 KL 时还有 reference 前向。失败不输出派生 YAML，
+  未覆盖完整决策组的 pilot 也不输出派生 YAML。
+
+本地对照入口（不下载模型）：
+
+```bash
+python experiments/compare_fast_stats.py --attention --train-steps 200 \
+  --output /tmp/fast-stats-comparison.json
+```
+
+内网对照已有配置（先限制到普通 Linear 子集；exact 对照本身仍较慢）：
+
+```bash
+python experiments/compare_fast_stats.py --config quantplan-run.yaml \
+  --max-groups 4 --seeds 7 --repeats 1 --output /tmp/fast-stats-pilot.json
+```
+
+脚本同时记录实际 F/B/Block 调用次数、墙钟时间、危险层 Top-K 召回率、
+有符号 ΔNLL 排名相关性和完整混配 ΔNLL。绝对 ΔNLL 的相关性只是辅助诊断。
+当前 dense toy 实验已验证“无重放”，但**未验证可靠的质量排序**；不建议据此
+替代现有 fast。训练 toy 使用相同合成文本拟合和校准，不能当作真实 LLM 结果。
+可复现的本地结果见 [实验记录](experiments/results/fast-stats-trained.json)。
+
+### 实验性方向模式：共享投影，保留误差方向
+
+```bash
+quantplan run --config quantplan-run.yaml --mode fast-taylor
+```
+
+`fast-taylor` 不再把梯度、量化误差分别平方后相乘，而是保留它们的方向。
+对 Linear 的基线输入 `X`、权重 `W`、最终 NLL 总和的输出梯度 `G`，计算：
+
+```text
+R = G.T @ Q8(X)                             # 所有 W4A8/W8A8 候选共享
+weight_effect(q) = sum(R * (Qq(W) - W))
+activation_effect = sum(grad_X_branch * (Q8(X) - X))
+signed_effect(g,q) = sum(该组各 Linear 的两项 effect) / 有效 loss token 数
+```
+
+`grad_X_branch` 来自这个 Linear 的独立输入分支，不混入残差/其他分支的梯度。
+贡献对**所有位置**求和：某个位置没有直接预测标签，仍可能通过 attention 影响
+后续损失；mask 在最终 loss 处处理，不能再用 shifted-label mask 截掉这些梯度。
+这个代数分解保留同一 Linear 内的权重/激活误差交叉项，以及通道方向信息，
+但忽略候选 affine 输出舍入和多个量化位置之间的非线性相互作用。
+
+实际开销是每批 `1 次完整前向 + 1 次完整反向`，再加每个 Linear 一份共享梯度
+投影、每候选的权重 QDQ/归约；**不是总共只有一次 F+B 的计算量**。
+投影按权重行和 token 分块，不保留整模型权重梯度，不重放候选 affine 或 Block。
+报告中的 `local_gradient_projections` 统计逻辑投影，`local_gradient_gemms`
+统计实际分块矩阵乘法，`candidate_weight_scans` 统计候选权重扫描。
+仍需保留反向激活和 Linear 输入边界缓存，不能据此声称显存下降。
+
+求解器需要非负分数，但把负 signed effect 全部截成零会丢失候选差异。
+因此同一个组的**所有候选（包括 BF16）统一加相同的非负偏移**，得到
+`estimated_risk = mean_first_order_effect + ranking_offset`。这不改变组内收益
+差值，也不会改变完整方案之间的分数差。跨组敏感度排行必须用原始
+`mean_first_order_effect`，不能直接比较带不同偏移的 `estimated_risk`。
+BF16 的原始 effect 恒为零，其偏移后分数不一定为零；负 effect 或零分均不代表
+量化安全或质量真的提高。`DirectionalMeasurement` 与其他证据家族隔离。
+
+本地 CPU tiny toy（6 层、有 causal attention、训练 200 步；3 seeds × 3 repeats）
+的真实 runtime API 耗时如下；不含后续完整方案验证，也不代表 NPU/大模型性能：
+
+| 决策粒度 | exact | 原 fast | fast-stats | fast-taylor |
+| --- | ---: | ---: | ---: | ---: |
+| 6 个 Block 组 | 36.89 ms | 21.82 ms | 19.93 ms | 20.59 ms |
+| 同 Block 内细分 42 组 | 196.93 ms | 55.52 ms | 19.68 ms | 20.20 ms |
+
+细分场景约比原 fast 快 2.75 倍，主要收益是避免同一个 Block 被多个决策域反复重放。
+但训练后的 W4A8 排名相关性仍不稳定：6 组为 `0.086/0.314/0.943`，42 组为
+`0.149/0.191/0.829`，存在漏掉危险层的情况，**尚不能替代可靠的质量验证**。
+结果见 [Block 分组](experiments/results/production-taylor-block-groups.json)和
+[细粒度分组](experiments/results/production-taylor-linear-groups.json)。可复现：
+
+```bash
+python experiments/probe_linear_taylor.py --production-shared --linear-groups \
+  --output /tmp/quantplan-taylor-comparison.json
+```
+
+内网可用普通 Linear 子集比较真实模型，保留现有配置：
+
+```bash
+python experiments/compare_fast_stats.py --config quantplan-run.yaml --include-taylor \
+  --max-groups 4 --seeds 7 --repeats 1 --output /tmp/quantplan-taylor-pilot.json
+```
+
+该模式仍仅支持标准 dense Linear 的 W4A8/W8A8/BF16；没有新增 W4A4、fused MoE、
+TP/EP 或 offload 支持。重复调用、缺失观测/梯度、checkpoint 重算、缓存被原地修改
+均明确阻断。保留原 YAML 安全锚点、融合域能力限制和 latency 成本接口；完整组合
+最多验证 3 个，首个通过 ΔNLL 门槛才允许继续编译，pilot 不输出完整派生 YAML。
+原 `exact` / `fast` / `fast-stats` 保留，默认仍为 `exact`。
+
 运行顺序：
 
 1. 加载模型并发现 Block、普通 Linear 和 fused expert target；
 2. 锁定 Vision、MTP、router 等默认排除路径；
 3. 用完整 `named_modules` 审计原始 ModelSlim YAML；
-4. 对每个 Block 的 W4A8/W8A8 候选执行整模型前向；
+4. 根据所选模式收集整模型干预、局部重放、统计或共享投影证据；
 5. 在成本预算下生成候选组合；
 6. 对完整组合重新测量 ΔNLL；
 7. 仅在质量门槛通过后编译派生 YAML。
@@ -247,6 +406,7 @@ entry point 接入。完整合同见
 - `risk-evidence.jsonl`：exact 为每个 Block/精度的整模型 ΔNLL；fast 为明确标记的
   梯度加权局部风险，不含伪造的 `delta_nll` 字段；
 - `candidate-plan.json`：成本受限候选及完整 assignments；
+- `latency-report.json`：启用 latency provider 时的候选延迟区间、组成项和警告；
 - `validation-report.json`：完整组合方案复测与冻结门槛；
 - `derived-modelslim.yaml`：通过门槛后才出现；
 - `plan.diff`：原 YAML 到派生 YAML 的统一 diff；

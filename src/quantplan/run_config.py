@@ -236,6 +236,71 @@ class SearchConfig:
 
 
 @dataclass(frozen=True)
+class LatencyConfig:
+    """Fast latency-estimation settings.
+
+    ``off`` preserves the historical normalized parameter-count cost.  The
+    static and calibrated modes are proposal signals; only the backend engine
+    can provide a final deployment measurement.
+    """
+
+    mode: str = "off"
+    deployment_mode: str = "decode_bs1"
+    memory_bandwidth_gbps: float | None = None
+    compute_tflops: float | None = None
+    memory_efficiency: float = 0.70
+    compute_efficiency: float = 0.50
+    launch_overhead_us: float = 2.0
+    qdq_overhead_us: float = 0.0
+    layout_overhead_us: float = 0.0
+    fallback_overhead_us: float = 0.0
+    uncertainty: float = 0.25
+    calibration_path: Path | None = None
+
+    def __post_init__(self) -> None:
+        normalized = self.mode.strip().lower()
+        if normalized not in {"off", "static", "calibrated"}:
+            raise RunConfigError("$.latency.mode must be off, static or calibrated")
+        object.__setattr__(self, "mode", normalized)
+        if not isinstance(self.deployment_mode, str) or not self.deployment_mode.strip():
+            raise RunConfigError("$.latency.deployment_mode must be a non-empty string")
+        object.__setattr__(self, "deployment_mode", self.deployment_mode.strip())
+        for name in ("memory_bandwidth_gbps", "compute_tflops"):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not isfinite(float(value))
+                or float(value) <= 0
+            ):
+                raise RunConfigError(f"$.latency.{name} must be null or positive")
+            if value is not None:
+                object.__setattr__(self, name, float(value))
+        for name in ("memory_efficiency", "compute_efficiency"):
+            value = getattr(self, name)
+            if not isfinite(float(value)) or not 0 < float(value) <= 1:
+                raise RunConfigError(f"$.latency.{name} must be in (0, 1]")
+            object.__setattr__(self, name, float(value))
+        for name in (
+            "launch_overhead_us",
+            "qdq_overhead_us",
+            "layout_overhead_us",
+            "fallback_overhead_us",
+        ):
+            value = getattr(self, name)
+            if not isfinite(float(value)) or float(value) < 0:
+                raise RunConfigError(f"$.latency.{name} must be finite and non-negative")
+            object.__setattr__(self, name, float(value))
+        if not isfinite(float(self.uncertainty)) or not 0 <= float(self.uncertainty) < 1:
+            raise RunConfigError("$.latency.uncertainty must be in [0, 1)")
+        object.__setattr__(self, "uncertainty", float(self.uncertainty))
+        if self.calibration_path is not None and not isinstance(self.calibration_path, Path):
+            raise RunConfigError("$.latency.calibration_path must be a path or null")
+        if self.mode == "calibrated" and self.calibration_path is None:
+            raise RunConfigError("$.latency.calibration_path is required in calibrated mode")
+
+
+@dataclass(frozen=True)
 class OutputConfig:
     model_inventory: Path = Path("model-inventory.json")
     risk_evidence: Path = Path("risk-evidence.jsonl")
@@ -246,6 +311,7 @@ class OutputConfig:
     diff: Path = Path("plan.diff")
     yaml_audit: Path = Path("yaml-audit.json")
     run_manifest: Path = Path("run-manifest.json")
+    latency_report: Path = Path("latency-report.json")
 
     def __post_init__(self) -> None:
         paths = {
@@ -258,6 +324,7 @@ class OutputConfig:
             "diff": self.diff,
             "yaml_audit": self.yaml_audit,
             "run_manifest": self.run_manifest,
+            "latency_report": self.latency_report,
         }
         for name, path in paths.items():
             _validate_output_path(path, f"$.output.{name}")
@@ -286,6 +353,7 @@ class RunConfig:
     analysis: AnalysisConfig = field(default_factory=AnalysisConfig)
     search: SearchConfig = field(default_factory=SearchConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    latency: LatencyConfig = field(default_factory=LatencyConfig)
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
@@ -304,6 +372,7 @@ class RunConfig:
             "candidates": (self.candidates, CandidateConfig),
             "analysis": (self.analysis, AnalysisConfig),
             "search": (self.search, SearchConfig),
+            "latency": (self.latency, LatencyConfig),
             "output": (self.output, OutputConfig),
         }
         for name, (value, expected_type) in sections.items():
@@ -335,6 +404,9 @@ class RunConfig:
                 "" if self.runtime.backend_capability_manifest is None
                 else str(self.runtime.backend_capability_manifest)
             ),
+            "latency_calibration_path": (
+                "" if self.latency.calibration_path is None else str(self.latency.calibration_path)
+            ),
         }
         return tuple(
             name for name, value in fields.items() if _PLACEHOLDER_MARKER in value
@@ -353,6 +425,7 @@ class RunConfig:
                 "diff": self.output_dir / self.output.diff,
                 "yaml_audit": self.output_dir / self.output.yaml_audit,
                 "run_manifest": self.output_dir / self.output.run_manifest,
+                "latency_report": self.output_dir / self.output.latency_report,
             }
         )
 
@@ -375,6 +448,11 @@ class RunConfig:
             raise RunConfigError(
                 "$.runtime.backend_capability_manifest is not a file: "
                 f"{self.runtime.backend_capability_manifest}"
+            )
+        if self.latency.calibration_path is not None and not self.latency.calibration_path.is_file():
+            raise RunConfigError(
+                "$.latency.calibration_path is not a file: "
+                f"{self.latency.calibration_path}"
             )
         if not self.original_yaml.is_file():
             raise RunConfigError(f"$.original_yaml is not a file: {self.original_yaml}")
@@ -457,6 +535,7 @@ def parse_run_config(
             "candidates",
             "analysis",
             "search",
+            "latency",
             "output",
         },
         "$",
@@ -623,6 +702,87 @@ def parse_run_config(
         costs=costs,
     )
 
+    latency_doc = _optional_mapping(root, "latency", "$.latency")
+    _reject_unknown(
+        latency_doc,
+        {
+            "mode",
+            "deployment_mode",
+            "memory_bandwidth_gbps",
+            "compute_tflops",
+            "memory_efficiency",
+            "compute_efficiency",
+            "launch_overhead_us",
+            "qdq_overhead_us",
+            "layout_overhead_us",
+            "fallback_overhead_us",
+            "uncertainty",
+            "calibration_path",
+        },
+        "$.latency",
+    )
+    raw_latency_mode = latency_doc.get("mode", "off")
+    # YAML 1.1 parses an unquoted ``off`` as boolean false.  Accept that
+    # spelling so hand-written configs remain unsurprising.
+    if raw_latency_mode is False:
+        raw_latency_mode = "off"
+    latency = LatencyConfig(
+        mode=_string(raw_latency_mode, "$.latency.mode"),
+        deployment_mode=_string(
+            latency_doc.get("deployment_mode", "decode_bs1"),
+            "$.latency.deployment_mode",
+        ),
+        memory_bandwidth_gbps=(
+            None
+            if latency_doc.get("memory_bandwidth_gbps") is None
+            else _number(
+                latency_doc["memory_bandwidth_gbps"],
+                "$.latency.memory_bandwidth_gbps",
+            )
+        ),
+        compute_tflops=(
+            None
+            if latency_doc.get("compute_tflops") is None
+            else _number(latency_doc["compute_tflops"], "$.latency.compute_tflops")
+        ),
+        memory_efficiency=_number(
+            latency_doc.get("memory_efficiency", 0.70),
+            "$.latency.memory_efficiency",
+        ),
+        compute_efficiency=_number(
+            latency_doc.get("compute_efficiency", 0.50),
+            "$.latency.compute_efficiency",
+        ),
+        launch_overhead_us=_number(
+            latency_doc.get("launch_overhead_us", 2.0),
+            "$.latency.launch_overhead_us",
+        ),
+        qdq_overhead_us=_number(
+            latency_doc.get("qdq_overhead_us", 0.0),
+            "$.latency.qdq_overhead_us",
+        ),
+        layout_overhead_us=_number(
+            latency_doc.get("layout_overhead_us", 0.0),
+            "$.latency.layout_overhead_us",
+        ),
+        fallback_overhead_us=_number(
+            latency_doc.get("fallback_overhead_us", 0.0),
+            "$.latency.fallback_overhead_us",
+        ),
+        uncertainty=_number(
+            latency_doc.get("uncertainty", 0.25), "$.latency.uncertainty"
+        ),
+        calibration_path=(
+            None
+            if latency_doc.get("calibration_path") is None
+            else _input_path(
+                latency_doc["calibration_path"],
+                "$.latency.calibration_path",
+                root_dir,
+            )
+        ),
+    )
+
     output_doc = _optional_mapping(root, "output", "$.output")
     output_names = {
         "model_inventory",
@@ -634,6 +794,7 @@ def parse_run_config(
         "diff",
         "yaml_audit",
         "run_manifest",
+        "latency_report",
     }
     _reject_unknown(output_doc, output_names, "$.output")
     defaults = OutputConfig()
@@ -656,6 +817,7 @@ def parse_run_config(
         candidates=candidates,
         analysis=analysis,
         search=search,
+        latency=latency,
         output=output,
     )
 
@@ -920,6 +1082,22 @@ search:
   # Normalized planning proxies, not measured hardware latency or memory.
   costs: {w4a4: 0.75, w4a8: 1.0, w8a8: 1.5, bf16: 2.5}
 
+# Optional fast latency model. Set mode=calibrated and provide a JSON file
+# with schema quantplan.latency-calibration/v1 for sparse operator corrections.
+latency:
+  mode: "off"  # off, static or calibrated
+  deployment_mode: decode_bs1
+  memory_bandwidth_gbps: null
+  compute_tflops: null
+  memory_efficiency: 0.70
+  compute_efficiency: 0.50
+  launch_overhead_us: 2.0
+  qdq_overhead_us: 0.0
+  layout_overhead_us: 0.0
+  fallback_overhead_us: 0.0
+  uncertainty: 0.25
+  calibration_path: null
+
 # Relative paths are confined under output_dir.
 output:
   model_inventory: model-inventory.json
@@ -931,6 +1109,7 @@ output:
   diff: plan.diff
   yaml_audit: yaml-audit.json
   run_manifest: run-manifest.json
+  latency_report: latency-report.json
 """
 
 
@@ -938,6 +1117,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "AnalysisConfig",
     "CandidateConfig",
+    "LatencyConfig",
     "ModuleSelectionConfig",
     "OutputConfig",
     "RunConfig",

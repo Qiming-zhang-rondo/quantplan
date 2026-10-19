@@ -4,7 +4,7 @@ import argparse
 import json
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -114,6 +114,8 @@ def _doctor(args: argparse.Namespace) -> int:
 
 def _run(args: argparse.Namespace) -> int:
     config = load_run_config(args.config)
+    if args.latency_mode is not None:
+        config = replace(config, latency=replace(config.latency, mode=args.latency_mode))
     preflight = inspect_environment(config)
     if not preflight.ready_for_analysis:
         print(
@@ -202,14 +204,23 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--config", type=Path, required=True)
     run_parser.add_argument(
         "--mode",
-        choices=("exact", "fast"),
+        choices=("exact", "fast", "fast-stats", "fast-taylor"),
         default="exact",
-        help="exact full-model interventions or fast gradient-weighted local ranking",
+        help=(
+            "exact full-model interventions, fast local block replay, or experimental "
+            "fast-stats factorized gradient statistics / fast-taylor shared projection "
+            "signed first-order ranking without candidate affine or block replay"
+        ),
     )
     run_parser.add_argument(
         "--overwrite",
         action="store_true",
         help="replace artifacts already present in output_dir",
+    )
+    run_parser.add_argument(
+        "--latency-mode",
+        choices=("off", "static", "calibrated"),
+        help="override the configured fast latency model for this run",
     )
     run_parser.set_defaults(handler=_run)
     return parser
